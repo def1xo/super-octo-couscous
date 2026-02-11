@@ -944,67 +944,132 @@ def _floor_to_step(value: float, step: float) -> float:
     return math.floor(value / step) * step
 
 
-def allocate_tp_volumes(tp_levels, total_volume: float, symbol: str):
-    """
-    Allocate total position size across TP levels.
+def allocate_tp_volumes(total_volume: float, weights, step_size: float = 0.001, min_qty: float = 0.0, max_slices: int = None):
+    """Split total volume by TP weights with step/minQty constraints.
 
-    Returns a list of quantities aligned with the iteration order of `tp_levels`.
-    Quantities are floored to LOT_SIZE stepSize and may contain zeros (which the caller can skip).
+    Returns a list aligned with `weights` where each element:
+    - is non-negative,
+    - is a multiple of `step_size` (if step_size > 0),
+    - keeps the total sum <= total_volume.
     """
     try:
-        n = len(tp_levels) if tp_levels is not None else 0
+        total_volume = float(total_volume)
     except Exception:
-        n = 0
-    if n <= 0 or total_volume is None:
+        return []
+    if (not math.isfinite(total_volume)) or total_volume <= 0:
         return []
 
-    # Defaults (safe fallbacks)
-    step = 0.001
-    min_qty = 0.0
+    try:
+        raw_weights = list(weights) if weights is not None else []
+    except Exception:
+        raw_weights = []
+
+    n = len(raw_weights)
+    if max_slices is not None:
+        try:
+            n = min(n, max(0, int(max_slices)))
+        except Exception:
+            pass
+    if n <= 0:
+        return []
+
+    safe_weights = []
+    for w in raw_weights[:n]:
+        try:
+            fw = float(w)
+            safe_weights.append(max(0.0, fw) if math.isfinite(fw) else 0.0)
+        except Exception:
+            safe_weights.append(0.0)
+
+    weight_sum = sum(safe_weights)
+    if weight_sum <= 0:
+        safe_weights = [1.0 / n] * n
+    else:
+        safe_weights = [w / weight_sum for w in safe_weights]
 
     try:
-        info = get_symbol_info_cached(symbol)
-        if info and isinstance(info, dict):
-            for f in info.get('filters', []):
-                if f.get('filterType') == 'LOT_SIZE':
-                    step = float(f.get('stepSize', step))
-                    min_qty = float(f.get('minQty', min_qty))
-                    break
+        step = float(step_size)
+        step = max(step, 0.0) if math.isfinite(step) else 0.0
     except Exception:
-        pass
+        step = 0.0
+    try:
+        min_qty = float(min_qty)
+        min_qty = max(min_qty, 0.0) if math.isfinite(min_qty) else 0.0
+    except Exception:
+        min_qty = 0.0
 
-    total_volume = float(total_volume)
-    if total_volume <= 0:
+    def _round_out(values, step_val):
+        if not values:
+            return values
+        if step_val <= 0:
+            return [float(v) for v in values]
+        try:
+            p = max(0, min(12, int(round(-math.log10(step_val)))))
+        except Exception:
+            p = 8
+        return [round(float(v), p) for v in values]
+
+    if step <= 0:
+        vols = [total_volume * w for w in safe_weights]
+        if min_qty > 0:
+            dust = 0.0
+            for i, v in enumerate(vols):
+                if 0 < v < min_qty:
+                    dust += v
+                    vols[i] = 0.0
+            if dust > 0:
+                target_idx = next((i for i in range(len(vols) - 1, -1, -1) if vols[i] > 0), len(vols) - 1)
+                vols[target_idx] += dust
+                if 0 < vols[target_idx] < min_qty:
+                    return [0.0] * len(vols)
+        return _round_out(vols, step)
+
+    # Integer-step allocation avoids floating drift and keeps deterministic totals.
+    total_steps = int(math.floor(total_volume / step + 1e-12))
+    if total_steps <= 0:
         return [0.0] * n
 
-    base = total_volume / n
-    vols = [_floor_to_step(base, step) for _ in range(n)]
+    raw_steps = [total_steps * w for w in safe_weights]
+    step_alloc = [int(math.floor(v + 1e-12)) for v in raw_steps]
+    leftovers = total_steps - sum(step_alloc)
+    if leftovers > 0:
+        order = sorted(range(n), key=lambda i: (raw_steps[i] - step_alloc[i], safe_weights[i]), reverse=True)
+        for i in range(leftovers):
+            step_alloc[order[i % n]] += 1
 
-    used = sum(vols)
-    remainder = total_volume - used
-    if remainder > 0:
-        vols[-1] += _floor_to_step(remainder, step)
+    if min_qty > 0:
+        min_steps = int(math.ceil(min_qty / step - 1e-12))
+        if min_steps > 1:
+            tiny_idx = [i for i, st in enumerate(step_alloc) if 0 < st < min_steps]
+            if tiny_idx:
+                moved_steps = sum(step_alloc[i] for i in tiny_idx)
+                for i in tiny_idx:
+                    step_alloc[i] = 0
+                target_idx = next((i for i in range(n - 1, -1, -1) if step_alloc[i] >= min_steps), None)
+                if target_idx is None:
+                    if total_steps >= min_steps:
+                        step_alloc = [0] * (n - 1) + [total_steps]
+                    else:
+                        step_alloc = [0] * n
+                else:
+                    step_alloc[target_idx] += moved_steps
 
-    # Drop dust below minQty (accumulate into last)
-    if min_qty and min_qty > 0:
-        dust = 0.0
-        for i, v in enumerate(vols):
-            if v > 0 and v < min_qty:
-                dust += v
-                vols[i] = 0.0
-        if dust > 0:
-            vols[-1] += _floor_to_step(dust, step)
-            if vols[-1] > 0 and vols[-1] < min_qty:
-                allq = _floor_to_step(total_volume, step)
-                vols = [0.0] * (n - 1) + ([allq] if allq >= min_qty else [0.0])
+    vols = [steps * step for steps in step_alloc]
 
-    # Guard against rounding overflow
-    s = sum(vols)
-    if s > total_volume and step > 0:
-        overflow = s - total_volume
-        vols[-1] = max(0.0, vols[-1] - _floor_to_step(overflow, step))
+    # Final safety clamp: due to numeric precision the sum can drift above stepped max.
+    max_sum = total_steps * step
+    cur_sum = sum(vols)
+    if cur_sum > max_sum + 1e-12:
+        overflow_steps = int(math.ceil((cur_sum - max_sum) / step - 1e-12))
+        for i in range(n - 1, -1, -1):
+            if overflow_steps <= 0:
+                break
+            take = min(step_alloc[i], overflow_steps)
+            step_alloc[i] -= take
+            overflow_steps -= take
+        vols = [steps * step for steps in step_alloc]
 
-    return vols
+    return _round_out(vols, step)
 
 
 def _pick_first_tp_order_id(entry_price: float, direction: str, tp_data_for_db: dict, fallback_ids=None):
