@@ -1,6 +1,6 @@
 import sqlite3
 import telebot
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import threading
 import json
 from binance.um_futures import UMFutures
@@ -809,6 +809,37 @@ def ensure_user_stream(user_id, api_key, secret_key):
         mgr.start()
         return mgr
 
+BOT_LANG = (os.environ.get("BOT_LANG") or "ru").strip().lower()
+_SIGNAL_MODE = (os.environ.get("SIGNAL_MODE") or "async").strip().lower()
+SIGNAL_MODE = _SIGNAL_MODE if _SIGNAL_MODE in ("async", "sync") else "async"
+
+I18N = {
+    "invalid_json": {
+        "ru": "невалидный json",
+        "en": "invalid json",
+    },
+    "queue_full": {
+        "ru": "очередь сигналов переполнена",
+        "en": "signal queue is full",
+    },
+    "queued": {
+        "ru": "сигнал добавлен в очередь",
+        "en": "signal queued",
+    },
+    "processed_sync": {
+        "ru": "сигнал обработан синхронно",
+        "en": "signal processed synchronously",
+    },
+}
+
+
+def tr(key: str) -> str:
+    try:
+        d = I18N.get(key) or {}
+        return d.get(BOT_LANG) or d.get("ru") or key
+    except Exception:
+        return key
+
 SIGNAL_QUEUE_MAXSIZE = max(100, int(os.environ.get('SIGNAL_QUEUE_MAXSIZE', '2000')))
 SIGNAL_WORKERS = max(1, int(os.environ.get('SIGNAL_WORKERS', '2')))
 SIGNAL_QUEUE = queue.Queue(maxsize=SIGNAL_QUEUE_MAXSIZE)
@@ -855,12 +886,33 @@ def send_trade_notification(user_id, message):
 def webhook(symbol):
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return ({'ok': False, 'error': 'invalid json'}, 400)
-    data['symbol'] = symbol.upper()
-    if not _enqueue_signal(data):
+        return jsonify({'ok': False, 'error': tr('invalid_json')}), 400
+    payload = dict(data)
+    payload['symbol'] = symbol.upper()
+
+    if SIGNAL_MODE == 'sync':
+        process_signal(payload)
+        return jsonify({'ok': True, 'queued': False, 'mode': 'sync', 'message': tr('processed_sync')}), 200
+
+    if not _enqueue_signal(payload):
         # Fast-fail when backpressure grows too high instead of blocking webhook thread.
-        return ({'ok': False, 'error': 'signal queue is full'}, 503)
-    return ({'ok': True, 'queued': True, 'queue_size': SIGNAL_QUEUE.qsize()}, 202)
+        return jsonify({'ok': False, 'error': tr('queue_full'), 'mode': 'async'}), 503
+    return jsonify({'ok': True, 'queued': True, 'mode': 'async', 'message': tr('queued'), 'queue_size': SIGNAL_QUEUE.qsize()}), 202
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        'ok': True,
+        'signal_mode': SIGNAL_MODE,
+        'signal_workers': SIGNAL_WORKERS,
+        'signal_queue_size': SIGNAL_QUEUE.qsize(),
+        'signal_queue_maxsize': SIGNAL_QUEUE_MAXSIZE,
+        'trading_ws': _WS_TRADING_URL,
+        'user_stream_ws_base': _BINANCE_FAPI_WS_BASE,
+        'rest_base': _BINANCE_FAPI_REST_BASE,
+    }), 200
+
 SIGNAL_DEDUP_WINDOW_SEC = 4                                                                                   
 def _signal_fingerprint(signal: dict) -> str:
     try:
@@ -4118,6 +4170,7 @@ if __name__ == '__main__':
     start_signal_workers()
     try:
         logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+        logging.info(f'[startup] signal_mode={SIGNAL_MODE}, bot_lang={BOT_LANG}')
         logging.info(f'[startup] signal_workers={SIGNAL_WORKERS}, signal_queue_maxsize={SIGNAL_QUEUE_MAXSIZE}')
         logging.info(f'[startup] trading_ws={_WS_TRADING_URL}')
         logging.info(f'[startup] user_stream_ws_base={_BINANCE_FAPI_WS_BASE}')
