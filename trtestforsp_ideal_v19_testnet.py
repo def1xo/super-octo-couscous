@@ -956,7 +956,7 @@ def allocate_tp_volumes(total_volume: float, weights, step_size: float = 0.001, 
         total_volume = float(total_volume)
     except Exception:
         return []
-    if total_volume <= 0:
+    if (not math.isfinite(total_volume)) or total_volume <= 0:
         return []
 
     try:
@@ -976,7 +976,8 @@ def allocate_tp_volumes(total_volume: float, weights, step_size: float = 0.001, 
     safe_weights = []
     for w in raw_weights[:n]:
         try:
-            safe_weights.append(max(0.0, float(w)))
+            fw = float(w)
+            safe_weights.append(max(0.0, fw) if math.isfinite(fw) else 0.0)
         except Exception:
             safe_weights.append(0.0)
 
@@ -987,11 +988,13 @@ def allocate_tp_volumes(total_volume: float, weights, step_size: float = 0.001, 
         safe_weights = [w / weight_sum for w in safe_weights]
 
     try:
-        step = max(float(step_size), 0.0)
+        step = float(step_size)
+        step = max(step, 0.0) if math.isfinite(step) else 0.0
     except Exception:
         step = 0.0
     try:
-        min_qty = max(float(min_qty), 0.0)
+        min_qty = float(min_qty)
+        min_qty = max(min_qty, 0.0) if math.isfinite(min_qty) else 0.0
     except Exception:
         min_qty = 0.0
 
