@@ -19,6 +19,7 @@ from contextlib import contextmanager
 import re
 import websocket
 import uuid
+import queue
 
 # ---------------------------------------------------------------------------
 # Binance environment: mainnet vs futures testnet
@@ -807,6 +808,44 @@ def ensure_user_stream(user_id, api_key, secret_key):
         USER_STREAMS[user_id] = mgr
         mgr.start()
         return mgr
+
+SIGNAL_QUEUE_MAXSIZE = max(100, int(os.environ.get('SIGNAL_QUEUE_MAXSIZE', '2000')))
+SIGNAL_WORKERS = max(1, int(os.environ.get('SIGNAL_WORKERS', '2')))
+SIGNAL_QUEUE = queue.Queue(maxsize=SIGNAL_QUEUE_MAXSIZE)
+
+
+def _enqueue_signal(signal: dict) -> bool:
+    try:
+        SIGNAL_QUEUE.put_nowait(signal)
+        return True
+    except queue.Full:
+        return False
+    except Exception:
+        return False
+
+
+def _signal_worker_loop(worker_id: int):
+    while True:
+        item = SIGNAL_QUEUE.get()
+        try:
+            process_signal(item)
+        except Exception as e:
+            try:
+                logging.exception(f'[signal-worker-{worker_id}] process_signal failed: {e}')
+            except Exception:
+                pass
+        finally:
+            try:
+                SIGNAL_QUEUE.task_done()
+            except Exception:
+                pass
+
+
+def start_signal_workers():
+    for i in range(SIGNAL_WORKERS):
+        th = threading.Thread(target=_signal_worker_loop, args=(i + 1,), daemon=True, name=f'signal_worker_{i + 1}')
+        th.start()
+
 def send_trade_notification(user_id, message):
     try:
         bot.send_message(user_id, message)
@@ -814,10 +853,14 @@ def send_trade_notification(user_id, message):
         print(f'Ошибка отправки уведомления: {str(e)}')
 @app.route('/webhook/<symbol>', methods=['POST'])
 def webhook(symbol):
-    data = request.json
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return ({'ok': False, 'error': 'invalid json'}, 400)
     data['symbol'] = symbol.upper()
-    process_signal(data)
-    return ('OK', 200)
+    if not _enqueue_signal(data):
+        # Fast-fail when backpressure grows too high instead of blocking webhook thread.
+        return ({'ok': False, 'error': 'signal queue is full'}, 503)
+    return ({'ok': True, 'queued': True, 'queue_size': SIGNAL_QUEUE.qsize()}, 202)
 SIGNAL_DEDUP_WINDOW_SEC = 4                                                                                   
 def _signal_fingerprint(signal: dict) -> str:
     try:
@@ -4072,6 +4115,15 @@ def handle_input(message):
         bot.send_message(user_id, '❌ Ключи уже введены. Используйте /start для перезаписи.')
 if __name__ == '__main__':
     recalculate_losses()
+    start_signal_workers()
+    try:
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+        logging.info(f'[startup] signal_workers={SIGNAL_WORKERS}, signal_queue_maxsize={SIGNAL_QUEUE_MAXSIZE}')
+        logging.info(f'[startup] trading_ws={_WS_TRADING_URL}')
+        logging.info(f'[startup] user_stream_ws_base={_BINANCE_FAPI_WS_BASE}')
+        logging.info(f'[startup] rest_base={_BINANCE_FAPI_REST_BASE}')
+    except Exception:
+        pass
     telegram_thread = threading.Thread(target=run_telegram_bot)
     telegram_thread.start()
     balance_monitor = BalanceMonitor()
