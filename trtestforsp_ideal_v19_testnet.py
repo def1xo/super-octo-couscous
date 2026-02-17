@@ -1,6 +1,6 @@
 import sqlite3
 import telebot
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import threading
 import json
 from binance.um_futures import UMFutures
@@ -19,6 +19,7 @@ from contextlib import contextmanager
 import re
 import websocket
 import uuid
+import queue
 
 # ---------------------------------------------------------------------------
 # Binance environment: mainnet vs futures testnet
@@ -538,6 +539,7 @@ try:
 except Exception:
     pass
 cursor = conn.cursor()
+DB_LOCK = threading.Lock()
 cursor.execute('\nCREATE TABLE IF NOT EXISTS users (\n    user_id INTEGER PRIMARY KEY,\n    api_key TEXT,\n    secret_key TEXT,\n    balance REAL,\n    last_balance REAL,\n    initial_balance REAL,\n    is_active BOOLEAN DEFAULT 1,\n    last_deactivation INTEGER\n)\n')
 cursor.execute('\nCREATE TABLE IF NOT EXISTS positions_history (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    symbol TEXT,\n    user_id INTEGER,\n    direction TEXT,\n    entry_price REAL,\n    exit_price REAL,\n    pnl REAL,\n    closed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n    details TEXT \n)\n')
 cursor.execute('\nCREATE TABLE IF NOT EXISTS trading_pairs (\n    symbol TEXT PRIMARY KEY,\n    is_active BOOLEAN DEFAULT 1,\n    current_loss REAL DEFAULT 0.0\n)\n')
@@ -600,7 +602,6 @@ active_trailing_threads = {}
 BTC_VOLUME_PERCENT = 0.06
 ADMINS = [1901059519, 6189545928]
 active_trailing_threads_lock = threading.Lock()
-DB_LOCK = threading.Lock()
 @contextmanager
 def db_tx():
     with DB_LOCK:
@@ -807,6 +808,75 @@ def ensure_user_stream(user_id, api_key, secret_key):
         USER_STREAMS[user_id] = mgr
         mgr.start()
         return mgr
+
+BOT_LANG = (os.environ.get("BOT_LANG") or "ru").strip().lower()
+_SIGNAL_MODE = (os.environ.get("SIGNAL_MODE") or "async").strip().lower()
+SIGNAL_MODE = _SIGNAL_MODE if _SIGNAL_MODE in ("async", "sync") else "async"
+
+I18N = {
+    "invalid_json": {
+        "ru": "невалидный json",
+        "en": "invalid json",
+    },
+    "queue_full": {
+        "ru": "очередь сигналов переполнена",
+        "en": "signal queue is full",
+    },
+    "queued": {
+        "ru": "сигнал добавлен в очередь",
+        "en": "signal queued",
+    },
+    "processed_sync": {
+        "ru": "сигнал обработан синхронно",
+        "en": "signal processed synchronously",
+    },
+}
+
+
+def tr(key: str) -> str:
+    try:
+        d = I18N.get(key) or {}
+        return d.get(BOT_LANG) or d.get("ru") or key
+    except Exception:
+        return key
+
+SIGNAL_QUEUE_MAXSIZE = max(100, int(os.environ.get('SIGNAL_QUEUE_MAXSIZE', '2000')))
+SIGNAL_WORKERS = max(1, int(os.environ.get('SIGNAL_WORKERS', '2')))
+SIGNAL_QUEUE = queue.Queue(maxsize=SIGNAL_QUEUE_MAXSIZE)
+
+
+def _enqueue_signal(signal: dict) -> bool:
+    try:
+        SIGNAL_QUEUE.put_nowait(signal)
+        return True
+    except queue.Full:
+        return False
+    except Exception:
+        return False
+
+
+def _signal_worker_loop(worker_id: int):
+    while True:
+        item = SIGNAL_QUEUE.get()
+        try:
+            process_signal(item)
+        except Exception as e:
+            try:
+                logging.exception(f'[signal-worker-{worker_id}] process_signal failed: {e}')
+            except Exception:
+                pass
+        finally:
+            try:
+                SIGNAL_QUEUE.task_done()
+            except Exception:
+                pass
+
+
+def start_signal_workers():
+    for i in range(SIGNAL_WORKERS):
+        th = threading.Thread(target=_signal_worker_loop, args=(i + 1,), daemon=True, name=f'signal_worker_{i + 1}')
+        th.start()
+
 def send_trade_notification(user_id, message):
     try:
         bot.send_message(user_id, message)
@@ -814,10 +884,35 @@ def send_trade_notification(user_id, message):
         print(f'Ошибка отправки уведомления: {str(e)}')
 @app.route('/webhook/<symbol>', methods=['POST'])
 def webhook(symbol):
-    data = request.json
-    data['symbol'] = symbol.upper()
-    process_signal(data)
-    return ('OK', 200)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'ok': False, 'error': tr('invalid_json')}), 400
+    payload = dict(data)
+    payload['symbol'] = symbol.upper()
+
+    if SIGNAL_MODE == 'sync':
+        process_signal(payload)
+        return jsonify({'ok': True, 'queued': False, 'mode': 'sync', 'message': tr('processed_sync')}), 200
+
+    if not _enqueue_signal(payload):
+        # Fast-fail when backpressure grows too high instead of blocking webhook thread.
+        return jsonify({'ok': False, 'error': tr('queue_full'), 'mode': 'async'}), 503
+    return jsonify({'ok': True, 'queued': True, 'mode': 'async', 'message': tr('queued'), 'queue_size': SIGNAL_QUEUE.qsize()}), 202
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        'ok': True,
+        'signal_mode': SIGNAL_MODE,
+        'signal_workers': SIGNAL_WORKERS,
+        'signal_queue_size': SIGNAL_QUEUE.qsize(),
+        'signal_queue_maxsize': SIGNAL_QUEUE_MAXSIZE,
+        'trading_ws': _WS_TRADING_URL,
+        'user_stream_ws_base': _BINANCE_FAPI_WS_BASE,
+        'rest_base': _BINANCE_FAPI_REST_BASE,
+    }), 200
+
 SIGNAL_DEDUP_WINDOW_SEC = 4                                                                                   
 def _signal_fingerprint(signal: dict) -> str:
     try:
@@ -944,67 +1039,132 @@ def _floor_to_step(value: float, step: float) -> float:
     return math.floor(value / step) * step
 
 
-def allocate_tp_volumes(tp_levels, total_volume: float, symbol: str):
-    """
-    Allocate total position size across TP levels.
+def allocate_tp_volumes(total_volume: float, weights, step_size: float = 0.001, min_qty: float = 0.0, max_slices: int = None):
+    """Split total volume by TP weights with step/minQty constraints.
 
-    Returns a list of quantities aligned with the iteration order of `tp_levels`.
-    Quantities are floored to LOT_SIZE stepSize and may contain zeros (which the caller can skip).
+    Returns a list aligned with `weights` where each element:
+    - is non-negative,
+    - is a multiple of `step_size` (if step_size > 0),
+    - keeps the total sum <= total_volume.
     """
     try:
-        n = len(tp_levels) if tp_levels is not None else 0
+        total_volume = float(total_volume)
     except Exception:
-        n = 0
-    if n <= 0 or total_volume is None:
+        return []
+    if (not math.isfinite(total_volume)) or total_volume <= 0:
         return []
 
-    # Defaults (safe fallbacks)
-    step = 0.001
-    min_qty = 0.0
+    try:
+        raw_weights = list(weights) if weights is not None else []
+    except Exception:
+        raw_weights = []
+
+    n = len(raw_weights)
+    if max_slices is not None:
+        try:
+            n = min(n, max(0, int(max_slices)))
+        except Exception:
+            pass
+    if n <= 0:
+        return []
+
+    safe_weights = []
+    for w in raw_weights[:n]:
+        try:
+            fw = float(w)
+            safe_weights.append(max(0.0, fw) if math.isfinite(fw) else 0.0)
+        except Exception:
+            safe_weights.append(0.0)
+
+    weight_sum = sum(safe_weights)
+    if weight_sum <= 0:
+        safe_weights = [1.0 / n] * n
+    else:
+        safe_weights = [w / weight_sum for w in safe_weights]
 
     try:
-        info = get_symbol_info_cached(symbol)
-        if info and isinstance(info, dict):
-            for f in info.get('filters', []):
-                if f.get('filterType') == 'LOT_SIZE':
-                    step = float(f.get('stepSize', step))
-                    min_qty = float(f.get('minQty', min_qty))
-                    break
+        step = float(step_size)
+        step = max(step, 0.0) if math.isfinite(step) else 0.0
     except Exception:
-        pass
+        step = 0.0
+    try:
+        min_qty = float(min_qty)
+        min_qty = max(min_qty, 0.0) if math.isfinite(min_qty) else 0.0
+    except Exception:
+        min_qty = 0.0
 
-    total_volume = float(total_volume)
-    if total_volume <= 0:
+    def _round_out(values, step_val):
+        if not values:
+            return values
+        if step_val <= 0:
+            return [float(v) for v in values]
+        try:
+            p = max(0, min(12, int(round(-math.log10(step_val)))))
+        except Exception:
+            p = 8
+        return [round(float(v), p) for v in values]
+
+    if step <= 0:
+        vols = [total_volume * w for w in safe_weights]
+        if min_qty > 0:
+            dust = 0.0
+            for i, v in enumerate(vols):
+                if 0 < v < min_qty:
+                    dust += v
+                    vols[i] = 0.0
+            if dust > 0:
+                target_idx = next((i for i in range(len(vols) - 1, -1, -1) if vols[i] > 0), len(vols) - 1)
+                vols[target_idx] += dust
+                if 0 < vols[target_idx] < min_qty:
+                    return [0.0] * len(vols)
+        return _round_out(vols, step)
+
+    # Integer-step allocation avoids floating drift and keeps deterministic totals.
+    total_steps = int(math.floor(total_volume / step + 1e-12))
+    if total_steps <= 0:
         return [0.0] * n
 
-    base = total_volume / n
-    vols = [_floor_to_step(base, step) for _ in range(n)]
+    raw_steps = [total_steps * w for w in safe_weights]
+    step_alloc = [int(math.floor(v + 1e-12)) for v in raw_steps]
+    leftovers = total_steps - sum(step_alloc)
+    if leftovers > 0:
+        order = sorted(range(n), key=lambda i: (raw_steps[i] - step_alloc[i], safe_weights[i]), reverse=True)
+        for i in range(leftovers):
+            step_alloc[order[i % n]] += 1
 
-    used = sum(vols)
-    remainder = total_volume - used
-    if remainder > 0:
-        vols[-1] += _floor_to_step(remainder, step)
+    if min_qty > 0:
+        min_steps = int(math.ceil(min_qty / step - 1e-12))
+        if min_steps > 1:
+            tiny_idx = [i for i, st in enumerate(step_alloc) if 0 < st < min_steps]
+            if tiny_idx:
+                moved_steps = sum(step_alloc[i] for i in tiny_idx)
+                for i in tiny_idx:
+                    step_alloc[i] = 0
+                target_idx = next((i for i in range(n - 1, -1, -1) if step_alloc[i] >= min_steps), None)
+                if target_idx is None:
+                    if total_steps >= min_steps:
+                        step_alloc = [0] * (n - 1) + [total_steps]
+                    else:
+                        step_alloc = [0] * n
+                else:
+                    step_alloc[target_idx] += moved_steps
 
-    # Drop dust below minQty (accumulate into last)
-    if min_qty and min_qty > 0:
-        dust = 0.0
-        for i, v in enumerate(vols):
-            if v > 0 and v < min_qty:
-                dust += v
-                vols[i] = 0.0
-        if dust > 0:
-            vols[-1] += _floor_to_step(dust, step)
-            if vols[-1] > 0 and vols[-1] < min_qty:
-                allq = _floor_to_step(total_volume, step)
-                vols = [0.0] * (n - 1) + ([allq] if allq >= min_qty else [0.0])
+    vols = [steps * step for steps in step_alloc]
 
-    # Guard against rounding overflow
-    s = sum(vols)
-    if s > total_volume and step > 0:
-        overflow = s - total_volume
-        vols[-1] = max(0.0, vols[-1] - _floor_to_step(overflow, step))
+    # Final safety clamp: due to numeric precision the sum can drift above stepped max.
+    max_sum = total_steps * step
+    cur_sum = sum(vols)
+    if cur_sum > max_sum + 1e-12:
+        overflow_steps = int(math.ceil((cur_sum - max_sum) / step - 1e-12))
+        for i in range(n - 1, -1, -1):
+            if overflow_steps <= 0:
+                break
+            take = min(step_alloc[i], overflow_steps)
+            step_alloc[i] -= take
+            overflow_steps -= take
+        vols = [steps * step for steps in step_alloc]
 
-    return vols
+    return _round_out(vols, step)
 
 
 def _pick_first_tp_order_id(entry_price: float, direction: str, tp_data_for_db: dict, fallback_ids=None):
@@ -3971,22 +4131,46 @@ def button_handler(call):
         bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id, text=f'Баланс: {user[3]} USD\nСтатус: {is_active}', reply_markup=markup)
         bot.answer_callback_query(call.id, 'Статус изменён')
 @bot.message_handler(func=lambda m: True)
+
+
+def _auth_error_hint(exc: Exception) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    tips = []
+    if '-2015' in low or 'invalid api-key' in low:
+        tips.append('Проверьте, что ключи созданы именно для Binance Futures и имеют права Futures/Trade.')
+        tips.append('Проверьте IP whitelist для ключа (если включён whitelist).')
+        if BINANCE_TESTNET:
+            tips.append('Сейчас включен TESTNET. Используйте отдельные ключи с https://testnet.binancefuture.com (testnet и mainnet ключи не взаимозаменяемы).')
+        else:
+            tips.append('Сейчас включен MAINNET. Если вы создали testnet-ключи, переключите BINANCE_TESTNET=1 или BINANCE_ENV=testnet.')
+    elif '-1021' in low or 'timestamp for this request is outside of the recvwindow' in low:
+        tips.append('Проблема синхронизации времени. Проверьте системное время сервера (NTP).')
+    elif 'permission' in low:
+        tips.append('Проверьте permissions API ключа: Enable Futures + Trading.')
+    if not tips:
+        tips.append('Проверьте корректность API key / Secret, права ключа и окружение (mainnet/testnet).')
+    return ' '.join(tips)
+
 def handle_input(message):
     if message.text.startswith('/'):
         return
     user_id = message.from_user.id
-    text = message.text
+    text = (message.text or '').strip()
     if user_id not in ADMINS:
+        return
+    if not text:
+        bot.send_message(user_id, '❗ Пустое значение, отправьте ключ ещё раз.')
         return
     cursor.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
     conn.commit()
     cursor.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
     current_api, current_secret = cursor.fetchone() or (None, None)
-    if current_api is None:
+    if not current_api:
         cursor.execute('UPDATE users SET api_key = ? WHERE user_id = ?', (text, user_id))
         conn.commit()
         bot.send_message(user_id, 'Теперь введите секретный ключ:')
-    elif current_secret is None:
+    elif not current_secret:
         cursor.execute('UPDATE users SET secret_key = ? WHERE user_id = ?', (text, user_id))
         conn.commit()
         try:
@@ -4000,13 +4184,25 @@ def handle_input(message):
             conn.commit()
             bot.send_message(user_id, f'✅ Ключи сохранены. Начальный депозит: {initial_balance:.2f} USDT')
         except Exception as e:
-            bot.send_message(user_id, f'❌ Ошибка авторизации: {str(e)}. Проверьте ключи.')
+            hint = _auth_error_hint(e)
+            env_label = 'TESTNET' if BINANCE_TESTNET else 'MAINNET'
+            bot.send_message(user_id, f'❌ Ошибка авторизации ({env_label}): {str(e)}\n\n💡 {hint}')
             cursor.execute('UPDATE users SET api_key = NULL, secret_key = NULL WHERE user_id = ?', (user_id,))
             conn.commit()
     else:
         bot.send_message(user_id, '❌ Ключи уже введены. Используйте /start для перезаписи.')
 if __name__ == '__main__':
     recalculate_losses()
+    start_signal_workers()
+    try:
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+        logging.info(f'[startup] signal_mode={SIGNAL_MODE}, bot_lang={BOT_LANG}')
+        logging.info(f'[startup] signal_workers={SIGNAL_WORKERS}, signal_queue_maxsize={SIGNAL_QUEUE_MAXSIZE}')
+        logging.info(f'[startup] trading_ws={_WS_TRADING_URL}')
+        logging.info(f'[startup] user_stream_ws_base={_BINANCE_FAPI_WS_BASE}')
+        logging.info(f'[startup] rest_base={_BINANCE_FAPI_REST_BASE}')
+    except Exception:
+        pass
     telegram_thread = threading.Thread(target=run_telegram_bot)
     telegram_thread.start()
     balance_monitor = BalanceMonitor()
