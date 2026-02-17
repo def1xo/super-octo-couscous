@@ -4131,6 +4131,27 @@ def button_handler(call):
         bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id, text=f'Баланс: {user[3]} USD\nСтатус: {is_active}', reply_markup=markup)
         bot.answer_callback_query(call.id, 'Статус изменён')
 @bot.message_handler(func=lambda m: True)
+
+
+def _auth_error_hint(exc: Exception) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    tips = []
+    if '-2015' in low or 'invalid api-key' in low:
+        tips.append('Проверьте, что ключи созданы именно для Binance Futures и имеют права Futures/Trade.')
+        tips.append('Проверьте IP whitelist для ключа (если включён whitelist).')
+        if BINANCE_TESTNET:
+            tips.append('Сейчас включен TESTNET. Используйте отдельные ключи с https://testnet.binancefuture.com (testnet и mainnet ключи не взаимозаменяемы).')
+        else:
+            tips.append('Сейчас включен MAINNET. Если вы создали testnet-ключи, переключите BINANCE_TESTNET=1 или BINANCE_ENV=testnet.')
+    elif '-1021' in low or 'timestamp for this request is outside of the recvwindow' in low:
+        tips.append('Проблема синхронизации времени. Проверьте системное время сервера (NTP).')
+    elif 'permission' in low:
+        tips.append('Проверьте permissions API ключа: Enable Futures + Trading.')
+    if not tips:
+        tips.append('Проверьте корректность API key / Secret, права ключа и окружение (mainnet/testnet).')
+    return ' '.join(tips)
+
 def handle_input(message):
     if message.text.startswith('/'):
         return
@@ -4160,7 +4181,9 @@ def handle_input(message):
             conn.commit()
             bot.send_message(user_id, f'✅ Ключи сохранены. Начальный депозит: {initial_balance:.2f} USDT')
         except Exception as e:
-            bot.send_message(user_id, f'❌ Ошибка авторизации: {str(e)}. Проверьте ключи.')
+            hint = _auth_error_hint(e)
+            env_label = 'TESTNET' if BINANCE_TESTNET else 'MAINNET'
+            bot.send_message(user_id, f'❌ Ошибка авторизации ({env_label}): {str(e)}\n\n💡 {hint}')
             cursor.execute('UPDATE users SET api_key = NULL, secret_key = NULL WHERE user_id = ?', (user_id,))
             conn.commit()
     else:
