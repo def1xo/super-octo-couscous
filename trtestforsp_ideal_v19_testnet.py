@@ -539,6 +539,7 @@ try:
 except Exception:
     pass
 cursor = conn.cursor()
+DB_LOCK = threading.Lock()
 cursor.execute('\nCREATE TABLE IF NOT EXISTS users (\n    user_id INTEGER PRIMARY KEY,\n    api_key TEXT,\n    secret_key TEXT,\n    balance REAL,\n    last_balance REAL,\n    initial_balance REAL,\n    is_active BOOLEAN DEFAULT 1,\n    last_deactivation INTEGER\n)\n')
 cursor.execute('\nCREATE TABLE IF NOT EXISTS positions_history (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    symbol TEXT,\n    user_id INTEGER,\n    direction TEXT,\n    entry_price REAL,\n    exit_price REAL,\n    pnl REAL,\n    closed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n    details TEXT \n)\n')
 cursor.execute('\nCREATE TABLE IF NOT EXISTS trading_pairs (\n    symbol TEXT PRIMARY KEY,\n    is_active BOOLEAN DEFAULT 1,\n    current_loss REAL DEFAULT 0.0\n)\n')
@@ -601,7 +602,6 @@ active_trailing_threads = {}
 BTC_VOLUME_PERCENT = 0.06
 ADMINS = [1901059519, 6189545928]
 active_trailing_threads_lock = threading.Lock()
-DB_LOCK = threading.Lock()
 @contextmanager
 def db_tx():
     with DB_LOCK:
@@ -4156,18 +4156,21 @@ def handle_input(message):
     if message.text.startswith('/'):
         return
     user_id = message.from_user.id
-    text = message.text
+    text = (message.text or '').strip()
     if user_id not in ADMINS:
+        return
+    if not text:
+        bot.send_message(user_id, '❗ Пустое значение, отправьте ключ ещё раз.')
         return
     cursor.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
     conn.commit()
     cursor.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
     current_api, current_secret = cursor.fetchone() or (None, None)
-    if current_api is None:
+    if not current_api:
         cursor.execute('UPDATE users SET api_key = ? WHERE user_id = ?', (text, user_id))
         conn.commit()
         bot.send_message(user_id, 'Теперь введите секретный ключ:')
-    elif current_secret is None:
+    elif not current_secret:
         cursor.execute('UPDATE users SET secret_key = ? WHERE user_id = ?', (text, user_id))
         conn.commit()
         try:
