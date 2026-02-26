@@ -2409,7 +2409,38 @@ def cancel_all_orders(client, symbol, api_key, secret_key):
         if ok2:
             print(f'[INFO] Algo ордера для {symbol} отменены')
         else:
-            print(f'[WARN] Не удалось отменить algo ордера для {symbol}: {res2}')
+            code = None
+            try:
+                if isinstance(res2, dict):
+                    code = int(res2.get('code')) if res2.get('code') is not None else None
+            except Exception:
+                code = None
+            if code == -1022:
+                # Some accounts/environments reject bulk algo cancel endpoint even with valid keys.
+                # Fallback: fetch open algo orders and cancel one-by-one.
+                try:
+                    aok, aresp = _get_algo_open_orders(api_key, secret_key, symbol)
+                    if aok:
+                        aorders = aresp
+                        if isinstance(aresp, dict):
+                            aorders = aresp.get('orders') or aresp.get('data') or aresp.get('result') or []
+                        cancelled = 0
+                        for ao in aorders or []:
+                            try:
+                                aid = ao.get('algoId') or ao.get('aid') or ao.get('id')
+                                if aid is None:
+                                    continue
+                                _cancel_algo_order(api_key, secret_key, algoId=aid)
+                                cancelled += 1
+                            except Exception:
+                                pass
+                        print(f'[WARN] Bulk algo cancel rejected (-1022) for {symbol}; fallback cancelled {cancelled} algo orders')
+                    else:
+                        print(f'[WARN] Bulk algo cancel rejected (-1022) for {symbol}; fallback list failed: {aresp}')
+                except Exception as _fb_e:
+                    print(f'[WARN] Bulk algo cancel rejected (-1022) for {symbol}; fallback exception: {_fb_e}')
+            else:
+                print(f'[WARN] Не удалось отменить algo ордера для {symbol}: {res2}')
     except Exception as _e:
         print(f'[WARN] Ошибка при отмене algo ордеров для {symbol}: {_e}')
     return ok_normal
@@ -2433,17 +2464,14 @@ def ensure_cancel_all_orders(client, symbol, api_key=None, secret_key=None, veri
         try:
             methods_to_try = [
                 ('get_open_orders', {'symbol': symbol}),
-                ('open_orders', {'symbol': symbol}),
+                ('futures_get_open_orders', {'symbol': symbol}),
                 ('get_open_orders', {'symbol': symbol, 'limit': 100}),
             ]
             for mname, params in methods_to_try:
                 fn = getattr(client, mname, None)
                 if callable(fn):
                     try:
-                        try:
-                            open_orders = safe_api_call(fn, **params, retries=2)
-                        except TypeError:
-                            open_orders = safe_api_call(fn, retries=2)
+                        open_orders = safe_api_call(fn, **params, retries=2)
                         break
                     except Exception:
                         open_orders = None
