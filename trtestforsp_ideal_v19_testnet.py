@@ -882,6 +882,19 @@ def send_trade_notification(user_id, message):
         bot.send_message(user_id, message)
     except Exception as e:
         print(f'Ошибка отправки уведомления: {str(e)}')
+
+
+def send_trade_notifications(user_ids, message):
+    sent = set()
+    for uid in user_ids or []:
+        try:
+            uid_int = int(uid)
+        except Exception:
+            uid_int = uid
+        if uid_int in sent:
+            continue
+        sent.add(uid_int)
+        send_trade_notification(uid_int, message)
 @app.route('/webhook/<symbol>', methods=['POST'])
 def webhook(symbol):
     data = request.get_json(silent=True)
@@ -1819,11 +1832,7 @@ class TrailingStopThread(threading.Thread):
                     except Exception:
                         pass
                     try:
-                        send_trade_notification(1901059519, f'✅ Первый TP взят для {self.symbol}, orderId={self.first_tp_order_id}')
-                    except Exception:
-                        pass
-                    try:
-                        send_trade_notification(self.user_id, f'✅ Первый TP взят для {self.symbol}')
+                        send_trade_notifications([1901059519, self.user_id], f'✅ Первый TP взят для {self.symbol}, orderId={self.first_tp_order_id}')
                     except Exception:
                         pass
                 if do_poll:
@@ -1965,8 +1974,7 @@ class TrailingStopThread(threading.Thread):
                     print(f'[warn] move_stop_loss_to_initial_entry: cancel returned not-ok: {res}')
             message = f'✅ Стоп-лосс пары {self.symbol} перемещён в ТВХ: {new_stop_price:.{pprec}f}'
             try:
-                send_trade_notification(1901059519, message)
-                send_trade_notification(self.user_id, message)
+                send_trade_notifications([1901059519, self.user_id], message)
             except Exception:
                 pass
         except Exception as e:
@@ -2024,8 +2032,7 @@ class TrailingStopThread(threading.Thread):
                         pass
             message = f'✅ Стоп-лосс пары {self.symbol} перемещён в avg-entry: {new_stop_price:.{pprec}f}'
             try:
-                send_trade_notification(1901059519, message)
-                send_trade_notification(self.user_id, message)
+                send_trade_notifications([1901059519, self.user_id], message)
             except Exception:
                 pass
         except Exception as e:
@@ -2107,8 +2114,7 @@ class TrailingStopThread(threading.Thread):
                         pass
             message = f'✅ Стоп-лосс для {self.symbol} обновлён: Новый объем: {quantity:.{qprec}f}, Уровень стопа: {current_stop_price:.{pprec}f}'
             try:
-                send_trade_notification(1901059519, message)
-                send_trade_notification(self.user_id, message)
+                send_trade_notifications([1901059519, self.user_id], message)
             except Exception:
                 pass
         except Exception as e:
@@ -2243,11 +2249,7 @@ class TrailingStopThread(threading.Thread):
                     except Exception:
                         pass
                     try:
-                        send_trade_notification(1901059519, f'✅ Первый TP подтверждён (thread) для {self.symbol}, orderId={self.first_tp_order_id}')
-                    except Exception:
-                        pass
-                    try:
-                        send_trade_notification(self.user_id, f'✅ Первый TP подтверждён для {self.symbol}')
+                        send_trade_notifications([1901059519, self.user_id], f'✅ Первый TP подтверждён для {self.symbol}, orderId={self.first_tp_order_id}')
                     except Exception:
                         pass
                 return True
@@ -3473,19 +3475,55 @@ def handle_main_signal(signal):
         except Exception as e:
             logging.exception(f'[handle_main_signal] error while cancelling old stop before add: {e}')
         chosen_stop = new_stop
+        try:
+            if existing_current_entry is not None:
+                existing_stop_price = None
+                if pos_db and isinstance(pos_db, dict):
+                    try:
+                        esp = pos_db.get('stop_price')
+                        if esp is not None:
+                            existing_stop_price = float(esp)
+                    except Exception:
+                        existing_stop_price = None
+                if existing_stop_price is None and existing_stop_id:
+                    try:
+                        st_order = safe_api_call(client.query_order, symbol=symbol, orderId=existing_stop_id)
+                        if isinstance(st_order, dict):
+                            spv = st_order.get('stopPrice') or st_order.get('triggerPrice')
+                            if spv is not None:
+                                existing_stop_price = float(spv)
+                    except Exception:
+                        existing_stop_price = None
+                candidate_stops = [s for s in (new_stop, existing_stop_price) if s is not None and float(s) != 0]
+                if candidate_stops:
+                    ref_price = float(existing_current_entry)
+                    chosen_stop = max(candidate_stops, key=lambda s: abs(float(s) - ref_price))
+                    send_trade_notification(1901059519, f'[STOP_CHOSEN_ADD] {symbol}: выбран самый удалённый стоп {chosen_stop} (ref={ref_price})')
+        except Exception as e:
+            send_trade_notification(1901059519, f'[STOP_CHOOSE_ADD_ERR] {symbol}: {e}')
         stop_oid = None
         if chosen_stop and chosen_stop != 0:
             stop_side = 'BUY' if direction == 'SHORT' else 'SELL'
             stop_qty_str = f'{total_new_qty:.{qty_precision}f}'
             for attempt in range(3):
                 try:
-                    stop_order = safe_api_call(client.new_order, symbol=symbol, side=stop_side, type='STOP_MARKET', quantity=stop_qty_str, stopPrice=chosen_stop, reduceOnly=True, workingType='CONTRACT_PRICE')
-                    stop_oid = _extract_order_id(stop_order) if stop_order else None
+                    stop_kind, stop_oid, stop_raw = create_stop_order(
+                        api_key,
+                        secret_key,
+                        client,
+                        symbol=symbol,
+                        side=stop_side,
+                        quantity=stop_qty_str,
+                        stop_price=f'{chosen_stop:.{price_precision}f}',
+                        priceProtect=True,
+                        reduceOnly=True,
+                        closePosition=False,
+                        workingType='CONTRACT_PRICE'
+                    )
                     if stop_oid:
-                        send_trade_notification(1901059519, f'[STOP_CREATE_ADD] success attempt={attempt + 1} Price: {chosen_stop:.{price_precision}f}, Qty: {stop_qty_str}, ID: {stop_oid}')
+                        send_trade_notification(1901059519, f'[STOP_CREATE_ADD] success attempt={attempt + 1} kind={stop_kind} Price: {chosen_stop:.{price_precision}f}, Qty: {stop_qty_str}, ID: {stop_oid}')
                         break
-                    else:
-                        send_trade_notification(1901059519, f'[STOP_CREATE_ADD] attempt={attempt + 1} returned no orderId, retrying...')
+                    send_trade_notification(1901059519, f'[STOP_CREATE_ADD] attempt={attempt + 1} returned no orderId, retrying... raw={stop_raw}')
                 except Exception as e:
                     logging.exception(f'[handle_main_signal] Stop order placement error during add: attempt {attempt + 1}: {e}')
                     send_trade_notification(1901059519, f'[STOP_CREATE_ERR_ADD] attempt={attempt + 1} err={e}; SL={chosen_stop:.{price_precision}f}')
@@ -3621,11 +3659,7 @@ def handle_main_signal(signal):
         try:
             tp_msg_add = ', '.join([f'{p:.{price_precision}f}' for p in signal_prices_add]) if signal_prices_add else ''
             add_msg = f"[THREAD_START_ADD] 📈 Позиция {symbol} добавлена! (Add #{new_add_count})\n| Entry: {entry_price:.{price_precision}f}\n| Avg Entry: {new_avg_price:.{price_precision}f}\n| Stop: {chosen_stop:.{price_precision}f}\n| TP: {tp_msg_add}\n| Qty Added (requested): {target_qty_to_add:.{qty_precision}f}\n| Qty Added (applied): {added_qty:.{qty_precision}f}\n| Total Qty: {total_new_qty:.{qty_precision}f}\n| AddCount: {new_add_count}\n| entry_id={(entry_order.get('orderId') if isinstance(entry_order, dict) else entry_order)} stop_id={stop_oid} recovery_id={existing_recovery_id}"
-            send_trade_notification(1901059519, add_msg)
-            try:
-                send_trade_notification(user_id, add_msg)
-            except Exception:
-                pass
+            send_trade_notifications([1901059519, user_id], add_msg)
         except Exception as _e:
             logging.exception(f'[ADD_NOTIFY_ERR] {_e}')
         with active_trailing_threads_lock:
