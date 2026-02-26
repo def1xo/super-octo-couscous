@@ -2258,21 +2258,22 @@ class TrailingStopThread(threading.Thread):
         return False
     def get_realized_pnl_by_order(self):
         try:
-            client = get_trading_client(self.api_key, self.secret_key)
             current_time = int(time.time() * 1000)
             start_time = current_time - 3 * 24 * 60 * 60 * 1000
-            trades = safe_binance_call(client.get_income_history, symbol=self.symbol, startTime=start_time, endTime=current_time, limit=1)
-            pnl_trades = [float(t.get('income', 0)) for t in trades or [] if t.get('incomeType') == 'REALIZED_PNL' and t.get('symbol') == self.symbol]
-            total_pnl = sum(pnl_trades)
-            if abs(total_pnl) < 1e-08:
-                trades = safe_binance_call(client.get_income_history, startTime=start_time, endTime=current_time, limit=500)
-                pnl_trades = [float(t.get('income', 0)) for t in trades or [] if t.get('incomeType') == 'REALIZED_PNL' and t.get('symbol') == self.symbol]
-                total_pnl = sum(pnl_trades)
+            total_pnl = fetch_realized_pnl(
+                api_key=self.api_key,
+                secret_key=self.secret_key,
+                symbol=self.symbol,
+                start_time=start_time,
+                end_time=current_time,
+                limit=1000,
+            )
             try:
-                print(f'[DEBUG] get_realized_pnl {self.symbol}: {total_pnl}')
+                env_label = 'TESTNET' if BINANCE_TESTNET else 'MAINNET'
+                print(f'[DEBUG] get_realized_pnl {self.symbol} ({env_label} {_BINANCE_FAPI_REST_BASE}): {total_pnl}')
             except Exception:
                 pass
-            return total_pnl
+            return float(total_pnl)
         except Exception as e:
             print(f'Ошибка получения realized PNL для {self.symbol}: {str(e)}')
             return 0.0
@@ -2355,13 +2356,9 @@ class TrailingStopThread(threading.Thread):
                 pass
     def get_realized_pnl_by_order_DEPRECATED(self):
         try:
-            client = get_trading_client(self.api_key, self.secret_key)
             current_time = int(time.time() * 1000)
             start_time = current_time - 24 * 60 * 60 * 1000
-            trades = safe_binance_call(client.get_income_history, symbol=self.symbol, startTime=start_time, endTime=current_time, limit=1)
-            pnl_trades = [float(t.get('income', 0)) for t in trades or [] if t.get('incomeType') == 'REALIZED_PNL' and t.get('symbol') == self.symbol]
-            total_pnl = sum(pnl_trades)
-            return total_pnl
+            return fetch_realized_pnl(self.api_key, self.secret_key, self.symbol, start_time, current_time, limit=500)
         except Exception:
             return 0.0
     def cleanup_after_stop_loss(self):
@@ -2529,6 +2526,40 @@ def ensure_cancel_all_orders(client, symbol, api_key=None, secret_key=None, veri
     except Exception:
         pass
     return False
+
+
+def fetch_realized_pnl(api_key, secret_key, symbol, start_time, end_time, limit=1000):
+    """Fetch realized PnL from /fapi/v1/income using configured REST base (testnet/mainnet aware)."""
+    try:
+        base = _BINANCE_FAPI_REST_BASE
+        url = base + '/fapi/v1/income'
+        params = {
+            'incomeType': 'REALIZED_PNL',
+            'symbol': symbol,
+            'startTime': int(start_time),
+            'endTime': int(end_time),
+            'limit': int(limit),
+            'timestamp': binance_now_ms(),
+            'recvWindow': 60000,
+        }
+        code, resp = _get_signed(url, api_key, secret_key, params, timeout=15)
+        if code != 200:
+            return 0.0
+        items = resp if isinstance(resp, list) else (resp.get('rows') if isinstance(resp, dict) else [])
+        total = 0.0
+        for t in items or []:
+            try:
+                if str(t.get('incomeType')) != 'REALIZED_PNL':
+                    continue
+                if str(t.get('symbol')) != str(symbol):
+                    continue
+                total += float(t.get('income', 0) or 0)
+            except Exception:
+                continue
+        return float(total)
+    except Exception:
+        return 0.0
+
 def _signed_params(params, secret_key):
     p = params.copy()
     items = []
