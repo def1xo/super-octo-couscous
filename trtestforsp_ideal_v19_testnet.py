@@ -3985,8 +3985,19 @@ def handle_main_signal(signal):
         stop_side = 'BUY' if direction == 'SHORT' else 'SELL'
         stop_qty_str = f'{total_new_qty:.{qty_precision}f}'
         try:
-            stop_order = safe_api_call(client.new_order, symbol=symbol, side=stop_side, type='STOP_MARKET', quantity=stop_qty_str, stopPrice=chosen_stop, reduceOnly=True, workingType='CONTRACT_PRICE')
-            stop_oid = _extract_order_id(stop_order) if stop_order else None
+            _stop_kind, stop_oid, stop_order = create_stop_order(
+                api_key=api_key,
+                secret_key=secret_key,
+                client=client,
+                symbol=symbol,
+                side=stop_side,
+                quantity=stop_qty_str,
+                stop_price=chosen_stop,
+                priceProtect=True,
+                reduceOnly=True,
+                closePosition=False,
+                workingType='CONTRACT_PRICE',
+            )
             send_trade_notification(1901059519, f'[STOP_CREATE] Price: {chosen_stop:.{price_precision}f}, Qty: {stop_qty_str}, ID: {stop_oid}')
         except Exception as e:
             logging.exception(f'[handle_main_signal] Stop order placement error: {e}')
