@@ -3270,48 +3270,52 @@ def handle_main_signal(signal):
         api_key, secret_key = (keys[0], keys[1])
         client = get_trading_client(api_key, secret_key)
         target_qty_to_add = None
+        signal_qty = None
         if signal.get('quantity'):
             try:
-                target_qty_to_add = float(signal.get('quantity'))
+                signal_qty = float(signal.get('quantity'))
             except Exception:
-                target_qty_to_add = None
+                signal_qty = None
+        # Add-size policy: every add should use the initial position quantity when possible.
+        # This keeps 1st/2nd/3rd adds deterministic: e.g. 100 -> +100 -> +100 -> +100.
         try:
+            db_initial = None
+            if pos_db and isinstance(pos_db, dict):
+                db_initial = pos_db.get('initial_quantity')
+                if db_initial is None:
+                    db_initial = pos_db.get('initial_qty')
+            initial_qty = None
+            if db_initial is not None:
+                try:
+                    db_initial_f = float(db_initial)
+                    if db_initial_f > 0:
+                        initial_qty = db_initial_f
+                except Exception:
+                    initial_qty = None
             try:
                 add_count_val = int(existing_add_count or 0)
             except Exception:
                 add_count_val = 0
-            initial_qty = None
-            try:
-                if is_existing_pos_in_db and float(existing_qty) > 0:
-                    initial_qty = float(existing_qty) / (1 + max(add_count_val, 0))
-            except Exception:
-                initial_qty = None
-            if target_qty_to_add is None and initial_qty and (initial_qty > 0):
+            if initial_qty is None:
+                try:
+                    if is_existing_pos_in_db and float(existing_qty) > 0:
+                        initial_qty = float(existing_qty) / (1 + max(add_count_val, 0))
+                except Exception:
+                    initial_qty = None
+            if initial_qty and (initial_qty > 0):
                 try:
                     target_qty_to_add = round(float(initial_qty), int(qty_precision))
                 except Exception:
                     target_qty_to_add = float(initial_qty)
-                send_trade_notification(1901059519, f'[ADD_QTY_INIT] Using initial qty for add: {target_qty_to_add:.{qty_precision}f}')
+                send_trade_notification(1901059519, f'[ADD_QTY_BASELINE] Using initial qty baseline for add: {target_qty_to_add:.{qty_precision}f}')
+            elif signal_qty and signal_qty > 0:
+                try:
+                    target_qty_to_add = round(float(signal_qty), int(qty_precision))
+                except Exception:
+                    target_qty_to_add = float(signal_qty)
+                send_trade_notification(1901059519, f'[ADD_QTY_SIGNAL_FALLBACK] initial qty unavailable, using signal quantity: {target_qty_to_add:.{qty_precision}f}')
         except Exception:
             target_qty_to_add = None
-        try:
-            if pos_db:
-                try:
-                    db_initial = pos_db.get('initial_quantity') if isinstance(pos_db, dict) else None
-                    if db_initial is None:
-                        try:
-                            db_initial = pos_db.get('initial_qty')
-                        except Exception:
-                            db_initial = None
-                    if db_initial is not None:
-                        db_initial_f = float(db_initial)
-                        if db_initial_f > 0:
-                            target_qty_to_add = round(db_initial_f, int(qty_precision))
-                            send_trade_notification(1901059519, f'[ADD_QTY_INIT_DB] Using initial_quantity from DB for add: {target_qty_to_add:.{qty_precision}f}')
-                except Exception:
-                    pass
-        except Exception:
-            pass
         if target_qty_to_add is None:
             thread_qty = None
             try:
