@@ -2459,20 +2459,26 @@ def ensure_cancel_all_orders(client, symbol, api_key=None, secret_key=None, veri
             pass
         open_orders = None
         try:
-            methods_to_try = [
-                ('get_open_orders', {'symbol': symbol}),
-                ('futures_get_open_orders', {'symbol': symbol}),
-                ('get_open_orders', {'symbol': symbol, 'limit': 100}),
-            ]
-            for mname, params in methods_to_try:
-                fn = getattr(client, mname, None)
-                if callable(fn):
-                    try:
-                        open_orders = safe_api_call(fn, **params, retries=2)
-                        break
-                    except Exception:
-                        open_orders = None
-                        continue
+            # Prefer direct signed REST call for consistency across connector versions.
+            if api_key and secret_key:
+                ok_open, resp_open = _get_open_orders(api_key, secret_key, symbol)
+                if ok_open:
+                    open_orders = resp_open
+            if open_orders is None:
+                methods_to_try = [
+                    ('get_open_orders', {'symbol': symbol}),
+                    ('futures_get_open_orders', {'symbol': symbol}),
+                    ('get_open_orders', {'symbol': symbol, 'limit': 100}),
+                ]
+                for mname, params in methods_to_try:
+                    fn = getattr(client, mname, None)
+                    if callable(fn):
+                        try:
+                            open_orders = safe_api_call(fn, **params, retries=2)
+                            break
+                        except Exception:
+                            open_orders = None
+                            continue
         except Exception:
             open_orders = None
         normal_empty = False
@@ -2813,6 +2819,16 @@ def _get_algo_open_orders(api_key, secret_key, symbol, recvWindow=60000, timeout
     """Get current open algo/conditional orders for a symbol (best-effort)."""
     base = _BINANCE_FAPI_REST_BASE
     endpoint = '/fapi/v1/openAlgoOrders'
+    url = base + endpoint
+    params = {'symbol': symbol, 'timestamp': binance_now_ms(), 'recvWindow': recvWindow}
+    code, resp = _get_signed(url, api_key, secret_key, params, timeout=timeout)
+    if code != 200:
+        return (False, resp)
+    return (True, resp)
+def _get_open_orders(api_key, secret_key, symbol, recvWindow=60000, timeout=15):
+    """Get current open normal orders for a symbol (best-effort)."""
+    base = _BINANCE_FAPI_REST_BASE
+    endpoint = '/fapi/v1/openOrders'
     url = base + endpoint
     params = {'symbol': symbol, 'timestamp': binance_now_ms(), 'recvWindow': recvWindow}
     code, resp = _get_signed(url, api_key, secret_key, params, timeout=timeout)
@@ -3254,48 +3270,52 @@ def handle_main_signal(signal):
         api_key, secret_key = (keys[0], keys[1])
         client = get_trading_client(api_key, secret_key)
         target_qty_to_add = None
+        signal_qty = None
         if signal.get('quantity'):
             try:
-                target_qty_to_add = float(signal.get('quantity'))
+                signal_qty = float(signal.get('quantity'))
             except Exception:
-                target_qty_to_add = None
+                signal_qty = None
+        # Add-size policy: every add should use the initial position quantity when possible.
+        # This keeps 1st/2nd/3rd adds deterministic: e.g. 100 -> +100 -> +100 -> +100.
         try:
+            db_initial = None
+            if pos_db and isinstance(pos_db, dict):
+                db_initial = pos_db.get('initial_quantity')
+                if db_initial is None:
+                    db_initial = pos_db.get('initial_qty')
+            initial_qty = None
+            if db_initial is not None:
+                try:
+                    db_initial_f = float(db_initial)
+                    if db_initial_f > 0:
+                        initial_qty = db_initial_f
+                except Exception:
+                    initial_qty = None
             try:
                 add_count_val = int(existing_add_count or 0)
             except Exception:
                 add_count_val = 0
-            initial_qty = None
-            try:
-                if is_existing_pos_in_db and float(existing_qty) > 0:
-                    initial_qty = float(existing_qty) / (1 + max(add_count_val, 0))
-            except Exception:
-                initial_qty = None
-            if target_qty_to_add is None and initial_qty and (initial_qty > 0):
+            if initial_qty is None:
+                try:
+                    if is_existing_pos_in_db and float(existing_qty) > 0:
+                        initial_qty = float(existing_qty) / (1 + max(add_count_val, 0))
+                except Exception:
+                    initial_qty = None
+            if initial_qty and (initial_qty > 0):
                 try:
                     target_qty_to_add = round(float(initial_qty), int(qty_precision))
                 except Exception:
                     target_qty_to_add = float(initial_qty)
-                send_trade_notification(1901059519, f'[ADD_QTY_INIT] Using initial qty for add: {target_qty_to_add:.{qty_precision}f}')
+                send_trade_notification(1901059519, f'[ADD_QTY_BASELINE] Using initial qty baseline for add: {target_qty_to_add:.{qty_precision}f}')
+            elif signal_qty and signal_qty > 0:
+                try:
+                    target_qty_to_add = round(float(signal_qty), int(qty_precision))
+                except Exception:
+                    target_qty_to_add = float(signal_qty)
+                send_trade_notification(1901059519, f'[ADD_QTY_SIGNAL_FALLBACK] initial qty unavailable, using signal quantity: {target_qty_to_add:.{qty_precision}f}')
         except Exception:
             target_qty_to_add = None
-        try:
-            if pos_db:
-                try:
-                    db_initial = pos_db.get('initial_quantity') if isinstance(pos_db, dict) else None
-                    if db_initial is None:
-                        try:
-                            db_initial = pos_db.get('initial_qty')
-                        except Exception:
-                            db_initial = None
-                    if db_initial is not None:
-                        db_initial_f = float(db_initial)
-                        if db_initial_f > 0:
-                            target_qty_to_add = round(db_initial_f, int(qty_precision))
-                            send_trade_notification(1901059519, f'[ADD_QTY_INIT_DB] Using initial_quantity from DB for add: {target_qty_to_add:.{qty_precision}f}')
-                except Exception:
-                    pass
-        except Exception:
-            pass
         if target_qty_to_add is None:
             thread_qty = None
             try:
