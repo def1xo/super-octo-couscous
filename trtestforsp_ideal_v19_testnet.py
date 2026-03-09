@@ -2459,20 +2459,26 @@ def ensure_cancel_all_orders(client, symbol, api_key=None, secret_key=None, veri
             pass
         open_orders = None
         try:
-            methods_to_try = [
-                ('get_open_orders', {'symbol': symbol}),
-                ('futures_get_open_orders', {'symbol': symbol}),
-                ('get_open_orders', {'symbol': symbol, 'limit': 100}),
-            ]
-            for mname, params in methods_to_try:
-                fn = getattr(client, mname, None)
-                if callable(fn):
-                    try:
-                        open_orders = safe_api_call(fn, **params, retries=2)
-                        break
-                    except Exception:
-                        open_orders = None
-                        continue
+            # Prefer direct signed REST call for consistency across connector versions.
+            if api_key and secret_key:
+                ok_open, resp_open = _get_open_orders(api_key, secret_key, symbol)
+                if ok_open:
+                    open_orders = resp_open
+            if open_orders is None:
+                methods_to_try = [
+                    ('get_open_orders', {'symbol': symbol}),
+                    ('futures_get_open_orders', {'symbol': symbol}),
+                    ('get_open_orders', {'symbol': symbol, 'limit': 100}),
+                ]
+                for mname, params in methods_to_try:
+                    fn = getattr(client, mname, None)
+                    if callable(fn):
+                        try:
+                            open_orders = safe_api_call(fn, **params, retries=2)
+                            break
+                        except Exception:
+                            open_orders = None
+                            continue
         except Exception:
             open_orders = None
         normal_empty = False
@@ -2813,6 +2819,16 @@ def _get_algo_open_orders(api_key, secret_key, symbol, recvWindow=60000, timeout
     """Get current open algo/conditional orders for a symbol (best-effort)."""
     base = _BINANCE_FAPI_REST_BASE
     endpoint = '/fapi/v1/openAlgoOrders'
+    url = base + endpoint
+    params = {'symbol': symbol, 'timestamp': binance_now_ms(), 'recvWindow': recvWindow}
+    code, resp = _get_signed(url, api_key, secret_key, params, timeout=timeout)
+    if code != 200:
+        return (False, resp)
+    return (True, resp)
+def _get_open_orders(api_key, secret_key, symbol, recvWindow=60000, timeout=15):
+    """Get current open normal orders for a symbol (best-effort)."""
+    base = _BINANCE_FAPI_REST_BASE
+    endpoint = '/fapi/v1/openOrders'
     url = base + endpoint
     params = {'symbol': symbol, 'timestamp': binance_now_ms(), 'recvWindow': recvWindow}
     code, resp = _get_signed(url, api_key, secret_key, params, timeout=timeout)
