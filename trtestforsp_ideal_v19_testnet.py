@@ -1575,6 +1575,7 @@ class TrailingStopThread(threading.Thread):
         self.filled_tp_count = 0
         self.first_tp_filled = False
         self.last_realized_pnl = None
+        self._realized_pnl_baseline = None
         self._cv = threading.Condition(self.lock)
         self._ws_flags = {
             'tp_filled': False,
@@ -1754,6 +1755,11 @@ class TrailingStopThread(threading.Thread):
         try:
             while self.active:
                 now_ts = time.time()
+                if self._realized_pnl_baseline is None:
+                    try:
+                        self._realized_pnl_baseline = float(self.get_realized_pnl_by_order() or 0.0)
+                    except Exception:
+                        self._realized_pnl_baseline = 0.0
                 with self.lock:
                     ws_tp = bool(self._ws_flags.get('tp_filled'))
                     ws_first = bool(self._ws_flags.get('first_tp_filled'))
@@ -2165,7 +2171,7 @@ class TrailingStopThread(threading.Thread):
                 rp_val = float(self.last_realized_pnl)
             else:
                 try:
-                    rp_val = float(self.get_realized_pnl_by_order() or 0.0)
+                    rp_val = float(self.get_realized_pnl_delta() or 0.0)
                 except Exception:
                     rp_val = 0.0
         except Exception:
@@ -2277,6 +2283,20 @@ class TrailingStopThread(threading.Thread):
         except Exception as e:
             print(f'Ошибка получения realized PNL для {self.symbol}: {str(e)}')
             return 0.0
+    def get_realized_pnl_delta(self):
+        """Best-effort PnL for current position lifetime (symbol-scoped)."""
+        try:
+            total_now = float(self.get_realized_pnl_by_order() or 0.0)
+        except Exception:
+            total_now = 0.0
+        try:
+            baseline = self._realized_pnl_baseline
+            if baseline is None:
+                self._realized_pnl_baseline = float(total_now)
+                return 0.0
+            return float(total_now) - float(baseline)
+        except Exception:
+            return float(total_now)
     def update_losses_after_position_closed(self, realized_pnl):
         try:
             if realized_pnl is None:
