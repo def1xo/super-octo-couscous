@@ -1663,7 +1663,7 @@ class TrailingStopThread(threading.Thread):
         if self._is_algo_stop_id(oid):
             algo_id = oid.split(':', 1)[1]
             try:
-                return _cancel_algo_order(self.api_key, self.secret_key, self.symbol, algo_id)
+                return _cancel_algo_order(self.api_key, self.secret_key, algoId=algo_id)
             except Exception as e:
                 return (False, str(e))
         return self._cancel_stop_order_by_id(oid)
@@ -1726,7 +1726,7 @@ class TrailingStopThread(threading.Thread):
                                 continue
                             if keep_is_algo and keep_algo_id and algo_id == str(keep_algo_id):
                                 continue
-                            _cancel_algo_order(self.api_key, self.secret_key, self.symbol, algo_id)
+                            _cancel_algo_order(self.api_key, self.secret_key, algoId=algo_id)
                         except Exception:
                             pass
         except Exception:
@@ -2566,8 +2566,8 @@ def fetch_realized_pnl(api_key, secret_key, symbol, start_time, end_time, limit=
     except Exception:
         return 0.0
 
-def _signed_params(params, secret_key):
-    p = params.copy()
+def _signed_items(params, secret_key):
+    p = (params or {}).copy()
     items = []
     for k in sorted(p.keys()):
         v = p[k]
@@ -2576,10 +2576,10 @@ def _signed_params(params, secret_key):
         items.append((k, str(v)))
     qs = urlencode(items, doseq=True)
     signature = hmac.new(secret_key.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
-    p["signature"] = signature
-    return p
+    items.append(("signature", signature))
+    return items
 def _get_signed(url, api_key, secret_key, params, timeout=15):
-    params = _signed_params(params, secret_key)
+    params = _signed_items(params, secret_key)
     headers = {"X-MBX-APIKEY": api_key}
     r = _http_request("GET", url, params=params, headers=headers, timeout=timeout)
     try:
@@ -2594,16 +2594,7 @@ def _get_signed(url, api_key, secret_key, params, timeout=15):
         pass
     return (r.status_code, j)
 def _post_signed(url, api_key, secret_key, params, timeout=15):
-    params = params.copy()
-    items = []
-    for k in sorted(params.keys()):
-        v = params[k]
-        if isinstance(v, bool):
-            v = 'true' if v else 'false'
-        items.append((k, str(v)))
-    qs = urlencode(items, doseq=True)
-    signature = hmac.new(secret_key.encode('utf-8'), qs.encode('utf-8'), hashlib.sha256).hexdigest()
-    params['signature'] = signature
+    params = _signed_items(params, secret_key)
     headers = {'X-MBX-APIKEY': api_key}
     r = _http_request('POST', url, params=params, headers=headers, timeout=timeout)
     try:
@@ -2618,16 +2609,7 @@ def _post_signed(url, api_key, secret_key, params, timeout=15):
         pass
     return (r.status_code, j)
 def _delete_signed(url, api_key, secret_key, params, timeout=15):
-    params = params.copy()
-    items = []
-    for k in sorted(params.keys()):
-        v = params[k]
-        if isinstance(v, bool):
-            v = 'true' if v else 'false'
-        items.append((k, str(v)))
-    qs = urlencode(items, doseq=True)
-    signature = hmac.new(secret_key.encode('utf-8'), qs.encode('utf-8'), hashlib.sha256).hexdigest()
-    params['signature'] = signature
+    params = _signed_items(params, secret_key)
     headers = {'X-MBX-APIKEY': api_key}
     r = _http_request('DELETE', url, params=params, headers=headers, timeout=timeout)
     try:
