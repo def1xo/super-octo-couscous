@@ -937,6 +937,56 @@ def health():
         'rest_base': _BINANCE_FAPI_REST_BASE,
     }), 200
 
+
+class HealthHeartbeatThread(threading.Thread):
+    """Sends periodic liveness heartbeat to the primary operator chat."""
+    def __init__(self, target_user_id=1901059519, interval_sec=None):
+        super().__init__(daemon=True)
+        self.target_user_id = int(target_user_id)
+        try:
+            self.interval_sec = int(interval_sec if interval_sec is not None else os.environ.get('HEALTH_HEARTBEAT_INTERVAL_SEC', '3600'))
+        except Exception:
+            self.interval_sec = 3600
+        if self.interval_sec < 60:
+            self.interval_sec = 60
+        self._stop = threading.Event()
+
+    def stop(self):
+        try:
+            self._stop.set()
+        except Exception:
+            pass
+
+    def _build_health_message(self):
+        try:
+            with active_trailing_threads_lock:
+                active_threads_count = len(active_trailing_threads)
+        except Exception:
+            active_threads_count = -1
+        try:
+            qsize = SIGNAL_QUEUE.qsize()
+        except Exception:
+            qsize = -1
+        now_local = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        return (
+            f'💚 [HEALTH] bot работает в штатном режиме\n'
+            f'time={now_local}\n'
+            f'queue={qsize}/{SIGNAL_QUEUE_MAXSIZE}\n'
+            f'active_trailing_threads={active_threads_count}\n'
+            f'mode={SIGNAL_MODE}'
+        )
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                send_trade_notification(self.target_user_id, self._build_health_message())
+            except Exception as e:
+                try:
+                    logging.warning(f'[health_heartbeat] send failed: {e}')
+                except Exception:
+                    pass
+            self._stop.wait(self.interval_sec)
+
 SIGNAL_DEDUP_WINDOW_SEC = 4                                                                                   
 def _signal_fingerprint(signal: dict) -> str:
     try:
@@ -4365,4 +4415,6 @@ if __name__ == '__main__':
     telegram_thread.start()
     balance_monitor = BalanceMonitor()
     balance_monitor.start()
+    health_heartbeat = HealthHeartbeatThread(target_user_id=1901059519)
+    health_heartbeat.start()
     app.run(port=5001, debug=False)
