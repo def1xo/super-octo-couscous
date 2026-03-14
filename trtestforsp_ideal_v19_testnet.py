@@ -2222,6 +2222,24 @@ class TrailingStopThread(threading.Thread):
         except Exception as e:
             print(f'[WARN] Ошибка проверки позиции {self.symbol}: {e}, помечаем как unknown')
             return None
+    def _resolve_realized_pnl_on_close(self, initial_value):
+        """Best-effort finalize realized PnL on close (income endpoint may lag)."""
+        try:
+            rp = float(initial_value or 0.0)
+        except Exception:
+            rp = 0.0
+        # Keep bot logic the same; only improve robustness against delayed income posting.
+        if abs(rp) > 1e-12:
+            return rp
+        for _ in range(3):
+            try:
+                time.sleep(1.2)
+                refreshed = float(self.get_realized_pnl_delta() or 0.0)
+                if abs(refreshed) > 1e-12:
+                    return refreshed
+            except Exception:
+                continue
+        return rp
     def _handle_position_closed(self, realized_pnl=None):
         if self.position_closed:
             return
@@ -2236,6 +2254,7 @@ class TrailingStopThread(threading.Thread):
                     rp_val = float(self.get_realized_pnl_delta() or 0.0)
                 except Exception:
                     rp_val = 0.0
+            rp_val = self._resolve_realized_pnl_on_close(rp_val)
         except Exception:
             rp_val = 0.0
         try:
@@ -3959,6 +3978,65 @@ def handle_main_signal(signal):
         return
     send_trade_notification(1901059519, f'[SIZE_CALC] balance_part={target_balance:.4f}, lev={leverage}, entry={entry_price:.4f}, raw_qty={target_qty_calc:.8f}')
     total_new_qty = target_qty_calc
+    # Loss recovery logic (aligned with provided fragment; max cap adjusted to 3x)
+    loss_recovery_active = False
+    with db_tx() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT total_loss FROM global_loss LIMIT 1')
+        total_loss_row = cursor.fetchone()
+        if total_loss_row:
+            total_loss = total_loss_row[0]
+            if total_loss > 0:
+                cursor.execute('SELECT COUNT(*) FROM trading_pairs WHERE is_active = 1')
+                num_active_pairs = cursor.fetchone()[0]
+                if num_active_pairs > 0:
+                    current_loss = total_loss / num_active_pairs
+                    loss_recovery_active = True
+                    send_trade_notification(1901059519, f'[RECOVERY] Loss recovery активен для {symbol}, общий убыток: {total_loss:.4f} USDT, активных пар: {num_active_pairs}, убыток на пару: {current_loss:.4f} USDT')
+                else:
+                    send_trade_notification(1901059519, '[RECOVERY] Loss recovery активен, но нет активных пар. current_loss = 0.')
+                    current_loss = 0.0
+            else:
+                current_loss = 0.0
+        else:
+            current_loss = 0.0
+    standard_quantity = total_new_qty
+    min_quantity = 10 ** (-qty_precision)
+    step_size = 10 ** (-qty_precision)
+    try:
+        for f in (symbol_info.get('filters', []) if isinstance(symbol_info, dict) else []):
+            if f.get('filterType') == 'LOT_SIZE':
+                if f.get('minQty') is not None:
+                    min_quantity = float(f.get('minQty'))
+                if f.get('stepSize') is not None:
+                    step_size = float(f.get('stepSize'))
+                break
+    except Exception:
+        pass
+    if loss_recovery_active and tp_levels:
+        if direction == 'LONG':
+            tp1 = min(tp_levels.values())
+        else:
+            tp1 = max(tp_levels.values())
+        profit_per_coin = (tp1 - entry_price) if direction == 'LONG' else (entry_price - tp1)
+        if profit_per_coin <= 0:
+            quantity = standard_quantity
+        else:
+            try:
+                required_profit = 0.3 * current_loss
+                raw_required_quantity = required_profit / (profit_per_coin * 0.4)
+                required_quantity = math.floor(raw_required_quantity / step_size) * step_size if step_size > 0 else raw_required_quantity
+                required_quantity = max(required_quantity, min_quantity)
+                max_allowed_quantity = standard_quantity * 3
+                required_quantity = min(required_quantity, max_allowed_quantity)
+                quantity = required_quantity if required_quantity > standard_quantity else standard_quantity
+                send_trade_notification(1901059519, f'[DEBUG RECOVERY] chosen_qty={quantity:.8f} (std={standard_quantity:.8f}, req={required_quantity:.8f}, cap3x={max_allowed_quantity:.8f})')
+            except Exception as e:
+                send_trade_notification(1901059519, f'[DEBUG RECOVERY] Ошибка расчёта: {e}, беру стандартный объём')
+                quantity = standard_quantity
+    else:
+        quantity = standard_quantity
+    total_new_qty = quantity
     try:
         res = safe_api_call(client.change_leverage, symbol=symbol, leverage=leverage)
         send_trade_notification(1901059519, f'[LEVERAGE] set {leverage} for {symbol}')
