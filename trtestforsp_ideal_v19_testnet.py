@@ -46,6 +46,7 @@ _BINANCE_FAPI_WS_BASE = (os.environ.get("BINANCE_FAPI_WS_BASE_URL") or _DEFAULT_
 
 _WS_TRADING_URL = os.environ.get("BINANCE_WS_TRADING_URL", _DEFAULT_WS_TRADING_URL)
 _WS_TRADING_RECV_WINDOW = int(os.environ.get("BINANCE_WS_RECV_WINDOW", "5000"))
+_WS_TRADING_TS_SAFETY_MS = int(os.environ.get("BINANCE_WS_TS_SAFETY_MS", "250"))
 
 def _gen_client_order_id(prefix: str, symbol: str) -> str:
     try:
@@ -214,39 +215,49 @@ class FuturesWSTradingSession:
     def is_connected(self) -> bool:
         return self._connected.is_set()
     def request(self, method: str, params: dict, timeout: float = 4.0) -> dict:
-        self.start()
-        if not self.is_connected():
-            raise WsAPIException(status=0, code=None, msg="WS not connected", raw={})
-        req_id = str(uuid.uuid4())
-        params = _ws_clean_params(params)
-        params["apiKey"] = self.api_key
-        params["timestamp"] = binance_now_ms()
-        params.setdefault("recvWindow", self.recv_window)
-        params["signature"] = self._sign(params)
-        payload = {"id": req_id, "method": method, "params": params}
-        ev = threading.Event()
-        holder = {}
-        with self._pending_lock:
-            self._pending[req_id] = (ev, holder)
-        try:
-            with self._send_lock:
-                self._wsapp.send(json.dumps(payload, separators=(",", ":")))
-        except Exception as e:
+        last_exc = None
+        for attempt in range(2):
+            self.start()
+            if not self.is_connected():
+                raise WsAPIException(status=0, code=None, msg="WS not connected", raw={})
+            req_id = str(uuid.uuid4())
+            params_to_send = _ws_clean_params(dict(params or {}))
+            params_to_send["apiKey"] = self.api_key
+            safe_ts = int(binance_now_ms()) - max(0, int(_WS_TRADING_TS_SAFETY_MS))
+            params_to_send["timestamp"] = safe_ts
+            params_to_send.setdefault("recvWindow", self.recv_window)
+            params_to_send["signature"] = self._sign(params_to_send)
+            payload = {"id": req_id, "method": method, "params": params_to_send}
+            ev = threading.Event()
+            holder = {}
+            with self._pending_lock:
+                self._pending[req_id] = (ev, holder)
+            try:
+                with self._send_lock:
+                    self._wsapp.send(json.dumps(payload, separators=(",", ":")))
+            except Exception as e:
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
+                raise WsAPIException(status=0, code=None, msg=f"send failed: {e}", raw={})
+            if not ev.wait(timeout=timeout):
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
+                raise WsAPIException(status=0, code=None, msg="timeout waiting WS response", raw={})
             with self._pending_lock:
                 self._pending.pop(req_id, None)
-            raise WsAPIException(status=0, code=None, msg=f"send failed: {e}", raw={})
-        if not ev.wait(timeout=timeout):
-            with self._pending_lock:
-                self._pending.pop(req_id, None)
-            raise WsAPIException(status=0, code=None, msg="timeout waiting WS response", raw={})
-        with self._pending_lock:
-            self._pending.pop(req_id, None)
-        data = holder.get("data") or {}
-        status = int(data.get("status") or 0)
-        if status != 200:
+            data = holder.get("data") or {}
+            status = int(data.get("status") or 0)
+            if status == 200:
+                return data.get("result") or data
             err = data.get("error") or {}
-            raise WsAPIException(status=status, code=err.get("code"), msg=str(err.get("msg") or data), raw=data)
-        return data.get("result") or data
+            last_exc = WsAPIException(status=status, code=err.get("code"), msg=str(err.get("msg") or data), raw=data)
+            if int(err.get("code") or 0) == -1021 and attempt == 0:
+                force_time_sync()
+                continue
+            raise last_exc
+        if last_exc is not None:
+            raise last_exc
+        raise WsAPIException(status=0, code=None, msg="unknown WS request error", raw={})
 
 _WS_TRADING_SESSIONS = {}
 _WS_TRADING_SESSIONS_LOCK = threading.Lock()
@@ -925,6 +936,56 @@ def health():
         'user_stream_ws_base': _BINANCE_FAPI_WS_BASE,
         'rest_base': _BINANCE_FAPI_REST_BASE,
     }), 200
+
+
+class HealthHeartbeatThread(threading.Thread):
+    """Sends periodic liveness heartbeat to the primary operator chat."""
+    def __init__(self, target_user_id=1901059519, interval_sec=None):
+        super().__init__(daemon=True)
+        self.target_user_id = int(target_user_id)
+        try:
+            self.interval_sec = int(interval_sec if interval_sec is not None else os.environ.get('HEALTH_HEARTBEAT_INTERVAL_SEC', '3600'))
+        except Exception:
+            self.interval_sec = 3600
+        if self.interval_sec < 60:
+            self.interval_sec = 60
+        self._stop = threading.Event()
+
+    def stop(self):
+        try:
+            self._stop.set()
+        except Exception:
+            pass
+
+    def _build_health_message(self):
+        try:
+            with active_trailing_threads_lock:
+                active_threads_count = len(active_trailing_threads)
+        except Exception:
+            active_threads_count = -1
+        try:
+            qsize = SIGNAL_QUEUE.qsize()
+        except Exception:
+            qsize = -1
+        now_local = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        return (
+            f'💚 [HEALTH] bot работает в штатном режиме\n'
+            f'time={now_local}\n'
+            f'queue={qsize}/{SIGNAL_QUEUE_MAXSIZE}\n'
+            f'active_trailing_threads={active_threads_count}\n'
+            f'mode={SIGNAL_MODE}'
+        )
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                send_trade_notification(self.target_user_id, self._build_health_message())
+            except Exception as e:
+                try:
+                    logging.warning(f'[health_heartbeat] send failed: {e}')
+                except Exception:
+                    pass
+            self._stop.wait(self.interval_sec)
 
 SIGNAL_DEDUP_WINDOW_SEC = 4                                                                                   
 def _signal_fingerprint(signal: dict) -> str:
@@ -1664,7 +1725,8 @@ class TrailingStopThread(threading.Thread):
         if self._is_algo_stop_id(oid):
             algo_id = oid.split(':', 1)[1]
             try:
-                return _cancel_algo_order(self.api_key, self.secret_key, algoId=algo_id)
+                resp = _cancel_algo_order(self.api_key, self.secret_key, algoId=algo_id)
+                return (True, resp)
             except Exception as e:
                 return (False, str(e))
         return self._cancel_stop_order_by_id(oid)
@@ -2160,6 +2222,24 @@ class TrailingStopThread(threading.Thread):
         except Exception as e:
             print(f'[WARN] Ошибка проверки позиции {self.symbol}: {e}, помечаем как unknown')
             return None
+    def _resolve_realized_pnl_on_close(self, initial_value):
+        """Best-effort finalize realized PnL on close (income endpoint may lag)."""
+        try:
+            rp = float(initial_value or 0.0)
+        except Exception:
+            rp = 0.0
+        # Keep bot logic the same; only improve robustness against delayed income posting.
+        if abs(rp) > 1e-12:
+            return rp
+        for _ in range(3):
+            try:
+                time.sleep(1.2)
+                refreshed = float(self.get_realized_pnl_delta() or 0.0)
+                if abs(refreshed) > 1e-12:
+                    return refreshed
+            except Exception:
+                continue
+        return rp
     def _handle_position_closed(self, realized_pnl=None):
         if self.position_closed:
             return
@@ -2174,6 +2254,7 @@ class TrailingStopThread(threading.Thread):
                     rp_val = float(self.get_realized_pnl_delta() or 0.0)
                 except Exception:
                     rp_val = 0.0
+            rp_val = self._resolve_realized_pnl_on_close(rp_val)
         except Exception:
             rp_val = 0.0
         try:
@@ -3038,16 +3119,38 @@ def handle_main_signal(signal):
                             api_key, secret_key = (keys[0], keys[1])
                     if api_key and secret_key:
                         client_check = get_trading_client(api_key, secret_key)
-                        pr = safe_api_call(client_check.get_position_risk, symbol=symbol)
-                        if pr:
-                            p = next((p for p in pr if p.get('symbol') == symbol), None)
-                            if p:
-                                try:
-                                    pos_amt_raw = p.get('positionAmt')
-                                    pos_amt = float(pos_amt_raw or 0)
-                                    active_on_exchange = abs(pos_amt) > 1e-08
-                                except Exception:
-                                    active_on_exchange = True
+                        check_errors = []
+                        for _chk_attempt in range(2):
+                            try:
+                                pr = safe_api_call(client_check.get_position_risk, symbol=symbol)
+                                if pr:
+                                    p = next((p for p in pr if p.get('symbol') == symbol), None)
+                                    if p:
+                                        pos_amt_raw = p.get('positionAmt')
+                                        pos_amt = float(pos_amt_raw or 0)
+                                        active_on_exchange = abs(pos_amt) > 1e-08
+                                        break
+                            except Exception as e:
+                                check_errors.append(str(e))
+                                if '-1021' in str(e) or 'recvWindow' in str(e) or 'Timestamp for this request' in str(e):
+                                    force_time_sync()
+                                    time.sleep(0.2)
+                                else:
+                                    time.sleep(0.2)
+                                continue
+                        if active_on_exchange is None:
+                            try:
+                                ok_open, open_resp = _get_open_orders(api_key, secret_key, symbol)
+                                if ok_open:
+                                    open_orders = open_resp
+                                    if isinstance(open_resp, dict):
+                                        open_orders = open_resp.get('orders') or open_resp.get('data') or open_resp.get('result') or []
+                                    if isinstance(open_orders, (list, tuple)) and len(open_orders) == 0:
+                                        active_on_exchange = False
+                            except Exception as e:
+                                check_errors.append(str(e))
+                        if active_on_exchange is None and check_errors:
+                            print(f'[BLOCK_CHECK_ERR] exchange check unresolved for {symbol}: {" | ".join(check_errors[-2:])}')
                     else:
                         active_on_exchange = True
                 except Exception as e:
@@ -3875,6 +3978,65 @@ def handle_main_signal(signal):
         return
     send_trade_notification(1901059519, f'[SIZE_CALC] balance_part={target_balance:.4f}, lev={leverage}, entry={entry_price:.4f}, raw_qty={target_qty_calc:.8f}')
     total_new_qty = target_qty_calc
+    # Loss recovery logic (aligned with provided fragment; max cap adjusted to 3x)
+    loss_recovery_active = False
+    with db_tx() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT total_loss FROM global_loss LIMIT 1')
+        total_loss_row = cursor.fetchone()
+        if total_loss_row:
+            total_loss = total_loss_row[0]
+            if total_loss > 0:
+                cursor.execute('SELECT COUNT(*) FROM trading_pairs WHERE is_active = 1')
+                num_active_pairs = cursor.fetchone()[0]
+                if num_active_pairs > 0:
+                    current_loss = total_loss / num_active_pairs
+                    loss_recovery_active = True
+                    send_trade_notification(1901059519, f'[RECOVERY] Loss recovery активен для {symbol}, общий убыток: {total_loss:.4f} USDT, активных пар: {num_active_pairs}, убыток на пару: {current_loss:.4f} USDT')
+                else:
+                    send_trade_notification(1901059519, '[RECOVERY] Loss recovery активен, но нет активных пар. current_loss = 0.')
+                    current_loss = 0.0
+            else:
+                current_loss = 0.0
+        else:
+            current_loss = 0.0
+    standard_quantity = total_new_qty
+    min_quantity = 10 ** (-qty_precision)
+    step_size = 10 ** (-qty_precision)
+    try:
+        for f in (symbol_info.get('filters', []) if isinstance(symbol_info, dict) else []):
+            if f.get('filterType') == 'LOT_SIZE':
+                if f.get('minQty') is not None:
+                    min_quantity = float(f.get('minQty'))
+                if f.get('stepSize') is not None:
+                    step_size = float(f.get('stepSize'))
+                break
+    except Exception:
+        pass
+    if loss_recovery_active and tp_levels:
+        if direction == 'LONG':
+            tp1 = min(tp_levels.values())
+        else:
+            tp1 = max(tp_levels.values())
+        profit_per_coin = (tp1 - entry_price) if direction == 'LONG' else (entry_price - tp1)
+        if profit_per_coin <= 0:
+            quantity = standard_quantity
+        else:
+            try:
+                required_profit = 0.3 * current_loss
+                raw_required_quantity = required_profit / (profit_per_coin * 0.4)
+                required_quantity = math.floor(raw_required_quantity / step_size) * step_size if step_size > 0 else raw_required_quantity
+                required_quantity = max(required_quantity, min_quantity)
+                max_allowed_quantity = standard_quantity * 3
+                required_quantity = min(required_quantity, max_allowed_quantity)
+                quantity = required_quantity if required_quantity > standard_quantity else standard_quantity
+                send_trade_notification(1901059519, f'[DEBUG RECOVERY] chosen_qty={quantity:.8f} (std={standard_quantity:.8f}, req={required_quantity:.8f}, cap3x={max_allowed_quantity:.8f})')
+            except Exception as e:
+                send_trade_notification(1901059519, f'[DEBUG RECOVERY] Ошибка расчёта: {e}, беру стандартный объём')
+                quantity = standard_quantity
+    else:
+        quantity = standard_quantity
+    total_new_qty = quantity
     try:
         res = safe_api_call(client.change_leverage, symbol=symbol, leverage=leverage)
         send_trade_notification(1901059519, f'[LEVERAGE] set {leverage} for {symbol}')
@@ -4331,4 +4493,6 @@ if __name__ == '__main__':
     telegram_thread.start()
     balance_monitor = BalanceMonitor()
     balance_monitor.start()
+    health_heartbeat = HealthHeartbeatThread(target_user_id=1901059519)
+    health_heartbeat.start()
     app.run(port=5001, debug=False)
