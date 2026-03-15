@@ -3202,8 +3202,8 @@ def handle_main_signal(signal):
     if is_existing_pos_in_db:
         with db_tx() as conn:
             cur = conn.cursor()
-            cursor.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
-            keys = cursor.fetchone()
+            cur.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
+            keys = cur.fetchone()
         if keys and keys[0] and keys[1]:
             api_key, secret_key = (keys[0], keys[1])
             try:
@@ -3260,8 +3260,8 @@ def handle_main_signal(signal):
             if not (api_key and secret_key):
                 with db_tx() as conn:
                     cur = conn.cursor()
-                    cursor.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
-                    keys = cursor.fetchone()
+                    cur.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
+                    keys = cur.fetchone()
                 if keys and keys[0] and keys[1]:
                     api_key, secret_key = (keys[0], keys[1])
             if api_key and secret_key:
@@ -3363,12 +3363,12 @@ def handle_main_signal(signal):
             with db_tx() as conn:
                 cur = conn.cursor()
                 new_missed_count = min(2, current_signals_missed + 1)
-                cursor.execute('INSERT OR REPLACE INTO symbol_cooldowns (symbol, signals_missed, consecutive_losses) VALUES (?, ?, ?)', (symbol, new_missed_count, current_consecutive_losses))
+                cur.execute('INSERT OR REPLACE INTO symbol_cooldowns (symbol, signals_missed, consecutive_losses) VALUES (?, ?, ?)', (symbol, new_missed_count, current_consecutive_losses))
             return
         with db_tx() as conn:
             cur = conn.cursor()
-            cursor.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
-            keys = cursor.fetchone()
+            cur.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
+            keys = cur.fetchone()
         if not (keys and keys[0] and keys[1]):
             send_trade_notification(1901059519, f'[ADD_ERROR] No API keys for user {user_id}')
             return
@@ -3901,8 +3901,8 @@ def handle_main_signal(signal):
     try:
         with db_tx() as conn:
             cur = conn.cursor()
-            cursor.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
-            keys = cursor.fetchone()
+            cur.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
+            keys = cur.fetchone()
         if not keys or not keys[0] or (not keys[1]):
             send_trade_notification(1901059519, f'[AUTH_ERROR] No API key/secret found for user {user_id}')
             return
@@ -3914,15 +3914,15 @@ def handle_main_signal(signal):
             pass
         with db_tx() as conn:
             cur = conn.cursor()
-            cursor.execute('SELECT is_active FROM users WHERE user_id = ?', (user_id,))
-            user_row = cursor.fetchone()
+            cur.execute('SELECT is_active FROM users WHERE user_id = ?', (user_id,))
+            user_row = cur.fetchone()
         if user_row and (not user_row[0]):
             send_trade_notification(1901059519, f'[USER_DISABLED] {user_id}')
             return
         with db_tx() as conn:
             cur = conn.cursor()
-            cursor.execute('SELECT is_active FROM trading_pairs WHERE symbol = ?', (symbol,))
-            r = cursor.fetchone()
+            cur.execute('SELECT is_active FROM trading_pairs WHERE symbol = ?', (symbol,))
+            r = cur.fetchone()
         if not r or not r[0]:
             send_trade_notification(1901059519, f'[PAIR_DISABLED] {symbol}')
             return
@@ -3981,14 +3981,14 @@ def handle_main_signal(signal):
     # Loss recovery logic (aligned with provided fragment; max cap adjusted to 3x)
     loss_recovery_active = False
     with db_tx() as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT total_loss FROM global_loss LIMIT 1')
-        total_loss_row = cursor.fetchone()
+        cur = conn.cursor()
+        cur.execute('SELECT total_loss FROM global_loss LIMIT 1')
+        total_loss_row = cur.fetchone()
         if total_loss_row:
             total_loss = total_loss_row[0]
             if total_loss > 0:
-                cursor.execute('SELECT COUNT(*) FROM trading_pairs WHERE is_active = 1')
-                num_active_pairs = cursor.fetchone()[0]
+                cur.execute('SELECT COUNT(*) FROM trading_pairs WHERE is_active = 1')
+                num_active_pairs = cur.fetchone()[0]
                 if num_active_pairs > 0:
                     current_loss = total_loss / num_active_pairs
                     loss_recovery_active = True
@@ -4244,7 +4244,7 @@ def handle_main_signal(signal):
         metadata_json = json.dumps({'price_precision': price_precision, 'qty_precision': qty_precision, 'timestamp': _now_iso()})
         with db_tx() as conn:
             cur = conn.cursor()
-            cursor.execute('\n                INSERT OR REPLACE INTO positions\n                (symbol, user_id, direction, quantity, entry_price, current_entry_price, stop_price, tp_data, entry_order_id, stop_order_id, recovery_order_id, metadata, add_count, signals_missed_after_stop)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ', (symbol, user_id, direction, total_new_qty, new_avg_price, fill_price, chosen_stop, json.dumps(tp_data_for_db), entry_order.get('orderId') if isinstance(entry_order, dict) else entry_order, stop_oid, None, metadata_json, 0, 0))
+            cur.execute('\n                INSERT OR REPLACE INTO positions\n                (symbol, user_id, direction, quantity, entry_price, current_entry_price, stop_price, tp_data, entry_order_id, stop_order_id, recovery_order_id, metadata, add_count, signals_missed_after_stop)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ', (symbol, user_id, direction, total_new_qty, new_avg_price, fill_price, chosen_stop, json.dumps(tp_data_for_db), entry_order.get('orderId') if isinstance(entry_order, dict) else entry_order, stop_oid, None, metadata_json, 0, 0))
         send_trade_notification(1901059519, f'[DB_UPDATE] Position for {symbol} updated successfully.')
         try:
             with db_tx() as conn:
