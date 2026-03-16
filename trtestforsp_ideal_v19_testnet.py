@@ -2060,6 +2060,14 @@ class TrailingStopThread(threading.Thread):
             quantity = self._get_current_quantity()
             if quantity is None or quantity <= 0:
                 raise ValueError(f'Некорректный quantity: {quantity}')
+            try:
+                position = self.client.get_position_risk(symbol=self.symbol)
+                position_data = next((p for p in position if float(p.get('positionAmt', 0)) != 0), {})
+                live_entry = float(position_data.get('entryPrice', 0) or 0)
+                if live_entry > 0:
+                    self.current_entry_price = live_entry
+            except Exception:
+                pass
             new_stop_price = float(self.current_entry_price)
             qprec = int(self.quantity_precision) if self.quantity_precision is not None else 8
             pprec = int(self.price_precision) if self.price_precision is not None else 2
