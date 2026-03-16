@@ -1637,6 +1637,7 @@ class TrailingStopThread(threading.Thread):
         self.first_tp_filled = False
         self.last_realized_pnl = None
         self._realized_pnl_baseline = None
+        self._realized_pnl_anchor_ms = int(time.time() * 1000)
         self._cv = threading.Condition(self.lock)
         self._ws_flags = {
             'tp_filled': False,
@@ -2346,7 +2347,9 @@ class TrailingStopThread(threading.Thread):
     def get_realized_pnl_by_order(self):
         try:
             current_time = int(time.time() * 1000)
-            start_time = current_time - 3 * 24 * 60 * 60 * 1000
+            default_start = current_time - 3 * 24 * 60 * 60 * 1000
+            anchor_start = int(getattr(self, '_realized_pnl_anchor_ms', current_time) or current_time) - 60 * 1000
+            start_time = max(default_start, anchor_start)
             total_pnl = fetch_realized_pnl(
                 api_key=self.api_key,
                 secret_key=self.secret_key,
