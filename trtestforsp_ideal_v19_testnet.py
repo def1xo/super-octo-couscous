@@ -1637,6 +1637,7 @@ class TrailingStopThread(threading.Thread):
         self.first_tp_filled = False
         self.last_realized_pnl = None
         self._realized_pnl_baseline = None
+        self._realized_pnl_anchor_ms = int(time.time() * 1000)
         self._cv = threading.Condition(self.lock)
         self._ws_flags = {
             'tp_filled': False,
@@ -2059,6 +2060,14 @@ class TrailingStopThread(threading.Thread):
             quantity = self._get_current_quantity()
             if quantity is None or quantity <= 0:
                 raise ValueError(f'Некорректный quantity: {quantity}')
+            try:
+                position = self.client.get_position_risk(symbol=self.symbol)
+                position_data = next((p for p in position if float(p.get('positionAmt', 0)) != 0), {})
+                live_entry = float(position_data.get('entryPrice', 0) or 0)
+                if live_entry > 0:
+                    self.current_entry_price = live_entry
+            except Exception:
+                pass
             new_stop_price = float(self.current_entry_price)
             qprec = int(self.quantity_precision) if self.quantity_precision is not None else 8
             pprec = int(self.price_precision) if self.price_precision is not None else 2
@@ -2346,7 +2355,9 @@ class TrailingStopThread(threading.Thread):
     def get_realized_pnl_by_order(self):
         try:
             current_time = int(time.time() * 1000)
-            start_time = current_time - 3 * 24 * 60 * 60 * 1000
+            default_start = current_time - 3 * 24 * 60 * 60 * 1000
+            anchor_start = int(getattr(self, '_realized_pnl_anchor_ms', current_time) or current_time) - 60 * 1000
+            start_time = max(default_start, anchor_start)
             total_pnl = fetch_realized_pnl(
                 api_key=self.api_key,
                 secret_key=self.secret_key,
