@@ -540,7 +540,7 @@ app = Flask(__name__)
 bot = telebot.TeleBot(os.environ.get('TELEGRAM_BOT_TOKEN', '7680871680:AAHPx1Mf6viK9z0ByqUuzrHtF2htUOYeqhQ'))
 secret_key = []
 api_key = []
-conn = sqlite3.connect('users1.db', check_same_thread=False)
+conn = sqlite3.connect(os.environ.get('BINANCE_DB_PATH', 'binance_testnet_users.db'), check_same_thread=False)
 try:
     conn.execute('PRAGMA journal_mode=WAL;')
     conn.execute('PRAGMA synchronous=NORMAL;')
