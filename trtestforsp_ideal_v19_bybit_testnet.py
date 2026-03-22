@@ -1,3 +1,6 @@
+# Full logical mirror of trtestforsp_ideal_v19_testnet.py for the future Bybit migration.
+# At this stage the business logic is kept identical on purpose, while the service is split to its own file/DB/port.
+
 import sqlite3
 import telebot
 from flask import Flask, request, jsonify
@@ -540,7 +543,7 @@ app = Flask(__name__)
 bot = telebot.TeleBot(os.environ.get('TELEGRAM_BOT_TOKEN', '7680871680:AAHPx1Mf6viK9z0ByqUuzrHtF2htUOYeqhQ'))
 secret_key = []
 api_key = []
-conn = sqlite3.connect(os.environ.get('BINANCE_DB_PATH', 'binance_testnet_users.db'), check_same_thread=False)
+conn = sqlite3.connect(os.environ.get('BYBIT_DB_PATH', 'bybit_testnet_users.db'), check_same_thread=False)
 try:
     conn.execute('PRAGMA journal_mode=WAL;')
     conn.execute('PRAGMA synchronous=NORMAL;')
@@ -4498,6 +4501,8 @@ if __name__ == '__main__':
         logging.info(f'[startup] trading_ws={_WS_TRADING_URL}')
         logging.info(f'[startup] user_stream_ws_base={_BINANCE_FAPI_WS_BASE}')
         logging.info(f'[startup] rest_base={_BINANCE_FAPI_REST_BASE}')
+        logging.info(f'[startup] logical_clone=trtestforsp_ideal_v19_testnet.py')
+        logging.info(f"[startup] bybit_bot_port={os.environ.get('BYBIT_BOT_PORT', '6001')}")
     except Exception:
         pass
     telegram_thread = threading.Thread(target=run_telegram_bot)
@@ -4506,4 +4511,4 @@ if __name__ == '__main__':
     balance_monitor.start()
     health_heartbeat = HealthHeartbeatThread(target_user_id=1901059519)
     health_heartbeat.start()
-    app.run(port=5001, debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get('BYBIT_BOT_PORT', '6001')), debug=False)
