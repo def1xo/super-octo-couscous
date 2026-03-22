@@ -2,7 +2,7 @@
 
 Ниже — максимально короткий запуск под твой сценарий: **оба файла лежат в одной папке**, тебе нужно только подставить свой `TELEGRAM_BOT_TOKEN`, после чего открыть 2 терминала для ботов и 1 команду для `nginx`.
 
-> Важно: `trtestforsp_ideal_v19_bybit_testnet.py` сейчас сделан как **полный логический клон** основного бота, но вынесен в отдельный файл, отдельную БД и отдельный порт `6001`, чтобы дальше уже поэтапно менять интеграцию на Bybit, не ломая основной процесс.
+> Важно: `trtestforsp_ideal_v19_bybit_testnet.py` теперь работает как **реальный Bybit testnet бот** на порту `6001` со своей БД и своими HTTP-запросами к Bybit V5 API.
 
 ## 0. Один раз установить зависимости
 Скопируй и выполни:
@@ -31,14 +31,14 @@ python3 trtestforsp_ideal_v19_testnet.py
 
 ---
 
-## 2. Терминал №2 — клон бота на `6001`
+## 2. Терминал №2 — Bybit testnet бот на `6001`
 Скопируй и выполни:
 
 ```bash
 cd /home/def1xo/super-octo-couscous/ && \
 source .venv/bin/activate && \
 export TELEGRAM_BOT_TOKEN='ВСТАВЬ_СЮДА_СВОЙ_TG_BOT_TOKEN' && \
-export BINANCE_TESTNET=1 && \
+export BYBIT_TESTNET=1 && \
 export BYBIT_BOT_PORT=6001 && \
 export BYBIT_DB_PATH=bybit_testnet_users.db && \
 python3 trtestforsp_ideal_v19_bybit_testnet.py
@@ -68,7 +68,7 @@ sudo systemctl reload nginx
 curl http://127.0.0.1:5001/health
 ```
 
-### Проверка клона на `6001`
+### Проверка Bybit testnet бота на `6001`
 ```bash
 curl http://127.0.0.1:6001/health
 ```
@@ -82,7 +82,7 @@ curl http://127.0.0.1/health
 
 ## 5. Что куда идёт сейчас
 - `5001` — основной бот.
-- `6001` — второй файл-клон под дальнейшую Bybit-адаптацию.
+- `6001` — реальный Bybit testnet бот.
 - `80` — `nginx`.
 - `nginx` отправляет основной запрос на `5001` и зеркалирует этот же запрос на `6001`.
 
