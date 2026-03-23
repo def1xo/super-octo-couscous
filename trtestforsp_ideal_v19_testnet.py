@@ -93,10 +93,10 @@ def _ws_clean_params(params: dict) -> dict:
     return out
 
 class FuturesWSTradingSession:
-    def __init__(self, api_key: str, secret_key: str, url: str = _WS_TRADING_URL, recv_window: int = _WS_TRADING_RECV_WINDOW):
+    def __init__(self, api_key: str, secret_key: str, url: str | None = None, recv_window: int = _WS_TRADING_RECV_WINDOW):
         self.api_key = api_key
         self.secret_key = secret_key
-        self.url = url
+        self.url = url or _WS_TRADING_URL
         self.recv_window = recv_window
         self._wsapp = None
         self._thread = None
@@ -598,6 +598,7 @@ try:
 except Exception as e:
     print(f"[migration] signal_dedup create failed: {e}")
 cursor.execute('CREATE INDEX IF NOT EXISTS idx_positions_user ON positions(user_id);')
+cursor.execute('CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)')
 cursor.execute('SELECT COUNT(*) FROM global_loss')
 if cursor.fetchone()[0] == 0:
     cursor.execute('INSERT INTO global_loss (id, total_loss) VALUES (1, 0.0)')
@@ -613,6 +614,101 @@ active_trailing_threads = {}
 BTC_VOLUME_PERCENT = 0.06
 ADMINS = [1901059519, 6189545928]
 active_trailing_threads_lock = threading.Lock()
+RUNTIME_CFG_LOCK = threading.Lock()
+
+def _setting_get(name, default=None):
+    try:
+        with DB_LOCK:
+            cursor.execute('SELECT value FROM bot_settings WHERE key = ?', (name,))
+            row = cursor.fetchone()
+        return row[0] if row and row[0] is not None else default
+    except Exception:
+        return default
+
+def _setting_set(name, value):
+    try:
+        with DB_LOCK:
+            cursor.execute('INSERT OR REPLACE INTO bot_settings(key, value) VALUES(?, ?)', (name, str(value)))
+            conn.commit()
+    except Exception as e:
+        logging.warning(f'[settings] failed to save {name}: {e}')
+
+def _parse_admin_selection(raw_value):
+    if raw_value is None:
+        return [ADMINS[0], ADMINS[1]]
+    parts = [p.strip() for p in str(raw_value).split(',') if p.strip()]
+    selected = []
+    for part in parts:
+        if part in ('1', '2'):
+            admin_id = ADMINS[int(part) - 1]
+            if admin_id not in selected:
+                selected.append(admin_id)
+    return selected or [ADMINS[0], ADMINS[1]]
+
+def get_selected_admin_ids():
+    return _parse_admin_selection(_setting_get('active_admins', '1,2'))
+
+def get_primary_admin_id():
+    selected = get_selected_admin_ids()
+    return int(selected[0] if selected else ADMINS[0])
+
+def get_notification_admin_ids(extra_ids=None):
+    selected = list(get_selected_admin_ids())
+    for uid in extra_ids or []:
+        try:
+            uid = int(uid)
+        except Exception:
+            pass
+        if uid not in selected:
+            selected.append(uid)
+    return selected
+
+def send_admin_notification(message, extra_ids=None):
+    send_trade_notifications(get_notification_admin_ids(extra_ids=extra_ids), message)
+
+def is_testnet_enabled():
+    return str(_setting_get('binance_testnet', '1' if BINANCE_TESTNET else '0')).strip().lower() in ('1', 'true', 'yes', 'on', 'testnet')
+
+def get_binance_mode_label():
+    return 'TESTNET' if BINANCE_TESTNET else 'MAINNET'
+
+def apply_binance_runtime_mode(enabled, persist=True):
+    global BINANCE_TESTNET, _DEFAULT_FAPI_REST_BASE, _DEFAULT_FAPI_WS_BASE, _DEFAULT_WS_TRADING_URL
+    global _BINANCE_FAPI_REST_BASE, _BINANCE_FAPI_WS_BASE, _WS_TRADING_URL, _TIME_SYNC
+    enabled = bool(enabled)
+    with RUNTIME_CFG_LOCK:
+        BINANCE_TESTNET = enabled
+        _DEFAULT_FAPI_REST_BASE = 'https://testnet.binancefuture.com' if enabled else 'https://fapi.binance.com'
+        _DEFAULT_FAPI_WS_BASE = 'wss://stream.binancefuture.com' if enabled else 'wss://fstream.binance.com'
+        _DEFAULT_WS_TRADING_URL = 'wss://testnet.binancefuture.com/ws-fapi/v1' if enabled else 'wss://ws-fapi.binance.com/ws-fapi/v1'
+        _BINANCE_FAPI_REST_BASE = _DEFAULT_FAPI_REST_BASE
+        _BINANCE_FAPI_WS_BASE = _DEFAULT_FAPI_WS_BASE
+        _WS_TRADING_URL = _DEFAULT_WS_TRADING_URL
+        try:
+            with _WS_TRADING_SESSIONS_LOCK:
+                for session in _WS_TRADING_SESSIONS.values():
+                    try:
+                        session.stop()
+                    except Exception:
+                        pass
+                _WS_TRADING_SESSIONS.clear()
+        except Exception:
+            pass
+        try:
+            with _TRADING_CLIENT_LOCK:
+                _TRADING_CLIENT_CACHE.clear()
+        except Exception:
+            pass
+        try:
+            with _REST_CLIENT_LOCK:
+                _REST_CLIENT_CACHE.clear()
+        except Exception:
+            pass
+        _TIME_SYNC = BinanceTimeSync(_BINANCE_FAPI_REST_BASE)
+        force_time_sync()
+        if persist:
+            _setting_set('binance_testnet', '1' if enabled else '0')
+
 @contextmanager
 def db_tx():
     with DB_LOCK:
@@ -635,12 +731,12 @@ def db_tx():
 USER_STREAMS = {}
 USER_STREAMS_LOCK = threading.Lock()
 class UserDataStreamManager(threading.Thread):
-    def __init__(self, user_id, api_key, secret_key, base_rest=_BINANCE_FAPI_REST_BASE, base_ws=None):
+    def __init__(self, user_id, api_key, secret_key, base_rest=None, base_ws=None):
         super().__init__(daemon=True)
         self.user_id = int(user_id)
         self.api_key = api_key
         self.secret_key = secret_key
-        self.base_rest = base_rest
+        self.base_rest = (base_rest or _BINANCE_FAPI_REST_BASE).rstrip('/')
         base_ws = (base_ws or _BINANCE_FAPI_WS_BASE)
         self.base_ws = str(base_ws).rstrip('/')
         self.listen_key = None
@@ -940,9 +1036,9 @@ def health():
 
 class HealthHeartbeatThread(threading.Thread):
     """Sends periodic liveness heartbeat to the primary operator chat."""
-    def __init__(self, target_user_id=1901059519, interval_sec=None):
+    def __init__(self, target_user_id=None, interval_sec=None):
         super().__init__(daemon=True)
-        self.target_user_id = int(target_user_id)
+        self.target_user_id = int(target_user_id) if target_user_id is not None else None
         try:
             self.interval_sec = int(interval_sec if interval_sec is not None else os.environ.get('HEALTH_HEARTBEAT_INTERVAL_SEC', '3600'))
         except Exception:
@@ -979,7 +1075,8 @@ class HealthHeartbeatThread(threading.Thread):
     def run(self):
         while not self._stop.is_set():
             try:
-                send_trade_notification(self.target_user_id, self._build_health_message())
+                target_user_id = self.target_user_id if self.target_user_id is not None else get_primary_admin_id()
+                send_trade_notification(target_user_id, self._build_health_message())
             except Exception as e:
                 try:
                     logging.warning(f'[health_heartbeat] send failed: {e}')
@@ -1061,7 +1158,14 @@ def process_signal(signal):
         pass
     signal_type = signal.get('type')
     if signal_type == 'main':
-        handle_main_signal(signal)
+        explicit_user_id = signal.get('user_id')
+        if explicit_user_id is not None:
+            handle_main_signal(signal)
+            return
+        for admin_user_id in get_selected_admin_ids():
+            signal_copy = dict(signal)
+            signal_copy['user_id'] = int(admin_user_id)
+            handle_main_signal(signal_copy)
 def _binance_min_notional(symbol_info):
     try:
         for f in symbol_info.get('filters', []):
@@ -1550,8 +1654,7 @@ def recalculate_losses():
                 cursor.execute('UPDATE trading_pairs SET current_loss = ? WHERE symbol = ?', (loss_per_pair, pair[0]))
             conn.commit()
             message = f'🔄 Перерасчет убытков после изменения количества активных пар\n📊 Новый общий убыток: {total_loss:.2f} USDT\n🔄 Убыток на пару: {loss_per_pair:.2f} USDT'
-            send_trade_notification(1901059519, message)
-            send_trade_notification(6189545928, message)
+            send_admin_notification(message)
     except Exception as e:
         print(f'Ошибка перерасчета убытков: {str(e)}')
 class BalanceMonitor(threading.Thread):
@@ -1571,8 +1674,7 @@ class BalanceMonitor(threading.Thread):
                         if elapsed_time >= 86400:
                             cursor.execute('UPDATE users SET is_active = 1, last_deactivation = NULL WHERE user_id = ?', (user_id,))
                             conn.commit()
-                            send_trade_notification(1901059519, f'✅ Торговля для пользователя {user_id} автоматически включена после 24 часов безactivité')
-                            send_trade_notification(6189545928, f'✅ Торговля для пользователя {user_id} автоматически включена после 24 часов безactivité')
+                            send_admin_notification(f'✅ Торговля для пользователя {user_id} автоматически включена после 24 часов безactivité')
                 cursor.execute('SELECT user_id, balance FROM users WHERE is_active = 1')
                 active_users = cursor.fetchall()
                 for user in active_users:
@@ -1586,8 +1688,7 @@ class BalanceMonitor(threading.Thread):
                             cursor.execute('UPDATE users SET is_active = 0, last_deactivation = ? WHERE user_id = ?', (current_time, user_id))
                             conn.commit()
                             msg = f'⚠️ Баланс упал на 20% за 24 часа! Было: {balance_24h_ago:.2f} USD, Сейчас: {current_balance:.2f} USD. Торговля остановлена.'
-                            send_trade_notification(1901059519, msg)
-                            send_trade_notification(6189545928, msg)
+                            send_admin_notification(msg)
                 old_timestamp = current_time - 172800
                 cursor.execute('DELETE FROM balance_history WHERE timestamp < ?', (old_timestamp,))
                 conn.commit()
@@ -1876,7 +1977,7 @@ class TrailingStopThread(threading.Thread):
                             except Exception:
                                 pass
                             try:
-                                send_trade_notification(1901059519, f'[STOP_MOVED] {self.symbol}: stop moved to avg-entry due to TP.')
+                                send_admin_notification(f'[STOP_MOVED] {self.symbol}: stop moved to avg-entry due to TP.')
                             except Exception:
                                 pass
                         except Exception as e:
@@ -1901,7 +2002,7 @@ class TrailingStopThread(threading.Thread):
                     except Exception:
                         pass
                     try:
-                        send_trade_notifications([1901059519, self.user_id], f'✅ Первый TP взят для {self.symbol}, orderId={self.first_tp_order_id}')
+                        send_trade_notifications(get_notification_admin_ids(extra_ids=[self.user_id]), f'✅ Первый TP взят для {self.symbol}, orderId={self.first_tp_order_id}')
                     except Exception:
                         pass
                 if do_poll:
@@ -2043,12 +2144,12 @@ class TrailingStopThread(threading.Thread):
                     print(f'[warn] move_stop_loss_to_initial_entry: cancel returned not-ok: {res}')
             message = f'✅ Стоп-лосс пары {self.symbol} перемещён в ТВХ: {new_stop_price:.{pprec}f}'
             try:
-                send_trade_notifications([1901059519, self.user_id], message)
+                send_trade_notifications(get_notification_admin_ids(extra_ids=[self.user_id]), message)
             except Exception:
                 pass
         except Exception as e:
             try:
-                send_trade_notification(1901059519, f'❗ Ошибка переноса стопа в ТВХ ({self.symbol}): {e}')
+                send_admin_notification(f'❗ Ошибка переноса стопа в ТВХ ({self.symbol}): {e}')
             except Exception:
                 pass
     def update_stop_loss(self):
@@ -2109,13 +2210,13 @@ class TrailingStopThread(threading.Thread):
                         pass
             message = f'✅ Стоп-лосс пары {self.symbol} перемещён в avg-entry: {new_stop_price:.{pprec}f}'
             try:
-                send_trade_notifications([1901059519, self.user_id], message)
+                send_trade_notifications(get_notification_admin_ids(extra_ids=[self.user_id]), message)
             except Exception:
                 pass
         except Exception as e:
             error_msg = f'❗ Ошибка при обновлении стоп-лосса: {str(e)}'
             try:
-                send_trade_notification(1901059519, error_msg)
+                send_admin_notification(error_msg)
             except Exception:
                 pass
     def _get_current_quantity(self):
@@ -2191,13 +2292,13 @@ class TrailingStopThread(threading.Thread):
                         pass
             message = f'✅ Стоп-лосс для {self.symbol} обновлён: Новый объем: {quantity:.{qprec}f}, Уровень стопа: {current_stop_price:.{pprec}f}'
             try:
-                send_trade_notifications([1901059519, self.user_id], message)
+                send_trade_notifications(get_notification_admin_ids(extra_ids=[self.user_id]), message)
             except Exception:
                 pass
         except Exception as e:
             error_msg = f'❗ Ошибка обновления стоп-лосса: {str(e)}'
             try:
-                send_trade_notification(1901059519, error_msg)
+                send_admin_notification(error_msg)
             except Exception:
                 pass
     def _is_any_tp_filled(self):
@@ -2279,18 +2380,18 @@ class TrailingStopThread(threading.Thread):
                     if curr_losses >= 2:
                         cur.execute('UPDATE symbol_cooldowns SET signals_missed = 0 WHERE symbol = ?', (self.symbol,))
                         try:
-                            send_trade_notification(1901059519, f'[COOLDOWN_START] {self.symbol}: закрытие в убытке {rp_val:.2f} — 2 подряд убытка, начинаем пропускать 2 сигнала')
+                            send_admin_notification(f'[COOLDOWN_START] {self.symbol}: закрытие в убытке {rp_val:.2f} — 2 подряд убытка, начинаем пропускать 2 сигнала')
                         except Exception:
                             pass
                     else:
                         try:
-                            send_trade_notification(1901059519, f'[LOSS_COUNT] {self.symbol}: подряд убытков {curr_losses}/2 — cooldown не активирован')
+                            send_admin_notification(f'[LOSS_COUNT] {self.symbol}: подряд убытков {curr_losses}/2 — cooldown не активирован')
                         except Exception:
                             pass
                 else:
                     cur.execute('DELETE FROM symbol_cooldowns WHERE symbol = ?', (self.symbol,))
                     try:
-                        send_trade_notification(1901059519, f'[COOLDOWN_CLEAR] {self.symbol}: закрытие в плюсе {rp_val:.2f} — сигналы разрешены, счётчик убытков сброшен')
+                        send_admin_notification(f'[COOLDOWN_CLEAR] {self.symbol}: закрытие в плюсе {rp_val:.2f} — сигналы разрешены, счётчик убытков сброшен')
                     except Exception:
                         pass
                 try:
@@ -2345,7 +2446,7 @@ class TrailingStopThread(threading.Thread):
                     except Exception:
                         pass
                     try:
-                        send_trade_notifications([1901059519, self.user_id], f'✅ Первый TP подтверждён для {self.symbol}, orderId={self.first_tp_order_id}')
+                        send_trade_notifications(get_notification_admin_ids(extra_ids=[self.user_id]), f'✅ Первый TP подтверждён для {self.symbol}, orderId={self.first_tp_order_id}')
                     except Exception:
                         pass
                 return True
@@ -2367,7 +2468,7 @@ class TrailingStopThread(threading.Thread):
                 limit=1000,
             )
             try:
-                env_label = 'TESTNET' if BINANCE_TESTNET else 'MAINNET'
+                env_label = get_binance_mode_label()
                 print(f'[DEBUG] get_realized_pnl {self.symbol} ({env_label} {_BINANCE_FAPI_REST_BASE}): {total_pnl}')
             except Exception:
                 pass
@@ -2413,7 +2514,7 @@ class TrailingStopThread(threading.Thread):
                         cur.execute('INSERT OR REPLACE INTO global_loss (id, total_loss) VALUES (1, ?)', (new_total_loss,))
                         conn.commit()
                         try:
-                            send_trade_notification(1901059519, f'[GLOBAL_LOSS_ADDED] Позиция {self.symbol} закрыта с убытком {add_amount:.2f}. New total_loss={new_total_loss:.2f}')
+                            send_admin_notification(f'[GLOBAL_LOSS_ADDED] Позиция {self.symbol} закрыта с убытком {add_amount:.2f}. New total_loss={new_total_loss:.2f}')
                         except Exception:
                             pass
                         reduction = 0.0
@@ -2424,7 +2525,7 @@ class TrailingStopThread(threading.Thread):
                         cur.execute('INSERT OR REPLACE INTO global_loss (id, total_loss) VALUES (1, ?)', (new_total_loss,))
                         conn.commit()
                         try:
-                            send_trade_notification(1901059519, f'[GLOBAL_LOSS_REDUCED] Позиция {self.symbol} закрыта с профитом {reduce_amount:.2f}. New total_loss={new_total_loss:.2f}')
+                            send_admin_notification(f'[GLOBAL_LOSS_REDUCED] Позиция {self.symbol} закрыта с профитом {reduce_amount:.2f}. New total_loss={new_total_loss:.2f}')
                         except Exception:
                             pass
             except Exception as e:
@@ -2452,7 +2553,7 @@ class TrailingStopThread(threading.Thread):
             try:
                 msg = f'📈 Прибыль по сделке: {rp:.2f} USDT\n📉 Отбито из общего убытка: {reduction:.2f} USDT\n📊 Новый общий убыток: {new_total_loss:.2f} USDT\n🔄 Текущий убыток на пару: {loss_per_pair:.2f} USDT'
                 try:
-                    send_trade_notification(1901059519, msg)
+                    send_admin_notification(msg)
                 except Exception:
                     pass
                 try:
@@ -2597,7 +2698,7 @@ def ensure_cancel_all_orders(client, symbol, api_key=None, secret_key=None, veri
         if open_orders is None:
             if ok:
                 try:
-                    send_trade_notification(1901059519, f'[ENSURE_CANCEL] assumed success (no open_orders response) symbol={symbol} attempt={attempt}')
+                    send_admin_notification(f'[ENSURE_CANCEL] assumed success (no open_orders response) symbol={symbol} attempt={attempt}')
                 except Exception:
                     pass
                 return True
@@ -2608,7 +2709,7 @@ def ensure_cancel_all_orders(client, symbol, api_key=None, secret_key=None, veri
                 normal_empty = True
         if not normal_empty:
             try:
-                send_trade_notification(1901059519, f"[ENSURE_CANCEL_RETRY] symbol={symbol} attempt={attempt} ok={ok} open_orders_count={(len(open_orders) if isinstance(open_orders, (list, tuple)) else 'unknown')}")
+                send_admin_notification(f"[ENSURE_CANCEL_RETRY] symbol={symbol} attempt={attempt} ok={ok} open_orders_count={(len(open_orders) if isinstance(open_orders, (list, tuple)) else 'unknown')}")
             except Exception:
                 pass
             delay = delay * 2
@@ -2622,7 +2723,7 @@ def ensure_cancel_all_orders(client, symbol, api_key=None, secret_key=None, veri
                         aorders = aresp.get('orders') or aresp.get('data') or aresp.get('result') or []
                     if isinstance(aorders, (list, tuple)) and len(aorders) == 0:
                         try:
-                            send_trade_notification(1901059519, f'[ENSURE_CANCEL] confirmed no normal+algo open orders for {symbol} attempt={attempt}')
+                            send_admin_notification(f'[ENSURE_CANCEL] confirmed no normal+algo open orders for {symbol} attempt={attempt}')
                         except Exception:
                             pass
                         return True
@@ -2634,13 +2735,13 @@ def ensure_cancel_all_orders(client, symbol, api_key=None, secret_key=None, veri
                 pass
         if not (api_key and secret_key):
             try:
-                send_trade_notification(1901059519, f'[ENSURE_CANCEL] confirmed no open orders for {symbol} attempt={attempt}')
+                send_admin_notification(f'[ENSURE_CANCEL] confirmed no open orders for {symbol} attempt={attempt}')
             except Exception:
                 pass
             return True
         delay = delay * 2
     try:
-        send_trade_notification(1901059519, f'[ENSURE_CANCEL_FAIL] failed to confirm cancellation for {symbol} after {retries} attempts')
+        send_admin_notification(f'[ENSURE_CANCEL_FAIL] failed to confirm cancellation for {symbol} after {retries} attempts')
     except Exception:
         pass
     return False
@@ -2992,7 +3093,7 @@ def cancel_order_flexible(api_key, secret_key, symbol, order_identifier, timeout
 def handle_main_signal(signal):
     logging.info(f'[handle_main_signal] Received signal: {signal}')
     try:
-        user_id = int(signal.get('user_id', 6189545928))
+        user_id = int(signal.get('user_id') or get_primary_admin_id())
         symbol = str(signal.get('symbol', '')).upper().replace('/', '')
         direction = str(signal.get('direction', 'LONG')).upper()
         entry_price = float(signal.get('entry_price', 0) or 0)
@@ -3017,13 +3118,13 @@ def handle_main_signal(signal):
         api_key = None
         secret_key = None
         try:
-            send_trade_notification(1901059519, f'[PARSE] user_id={user_id} symbol={symbol} dir={direction} entry={entry_price} stop={new_stop} tps={tp_levels}')
+            send_admin_notification(f'[PARSE] user_id={user_id} symbol={symbol} dir={direction} entry={entry_price} stop={new_stop} tps={tp_levels}')
         except Exception:
             pass
     except Exception as e:
         logging.exception('handle_main_signal: invalid payload')
         try:
-            send_trade_notification(1901059519, f'[ERROR_PARSE] {e}')
+            send_admin_notification(f'[ERROR_PARSE] {e}')
         except Exception:
             pass
         return
@@ -3041,7 +3142,7 @@ def handle_main_signal(signal):
                     conn.commit()
                     try:
                         if 'send_trade_notification' in globals():
-                            send_trade_notification(1901059519, f'SKIP_SIGNAL {symbol} ({signals_missed + 1}/2)')
+                            send_admin_notification(f'SKIP_SIGNAL {symbol} ({signals_missed + 1}/2)')
                     except Exception:
                         pass
                     return
@@ -3168,10 +3269,10 @@ def handle_main_signal(signal):
                     print(f'[BLOCK_CHECK_ERR] exchange check error for {symbol}: {e}')
                     active_on_exchange = None
                 if active_on_exchange is True:
-                    send_trade_notification(1901059519, f'[SKIP_NEW_POSITION] {symbol}: новая позиция заблокирована (stop_loss_moved={stop_moved_flag}, first_tp_filled={first_tp_flag})')
+                    send_admin_notification(f'[SKIP_NEW_POSITION] {symbol}: новая позиция заблокирована (stop_loss_moved={stop_moved_flag}, first_tp_filled={first_tp_flag})')
                     return
                 if active_on_exchange is None:
-                    send_trade_notification(1901059519, f'[SKIP_NEW_POSITION_UNSURE] {symbol}: блокировка по локальным флагам (stop_loss_moved={stop_moved_flag}, first_tp_filled={first_tp_flag}), exchange-check не подтвердил/ошибка')
+                    send_admin_notification(f'[SKIP_NEW_POSITION_UNSURE] {symbol}: блокировка по локальным флагам (stop_loss_moved={stop_moved_flag}, first_tp_filled={first_tp_flag}), exchange-check не подтвердил/ошибка')
                     return
     except Exception as e:
         print(f'[BLOCK_NEW_ENTRY_CHECK] unexpected error for {symbol}: {e}')
@@ -3200,7 +3301,7 @@ def handle_main_signal(signal):
         if stop_levels:
             try:
                 new_stop = max(stop_levels, key=lambda s: abs(float(s) - float(entry_price)))
-                send_trade_notification(1901059519, f'[STOP_CHOSEN] {symbol}: выбран самый удалённый стоп {new_stop}')
+                send_admin_notification(f'[STOP_CHOSEN] {symbol}: выбран самый удалённый стоп {new_stop}')
             except Exception as e:
                 new_stop = stop_levels[0]
                 print(f'[STOP_CHOOSE_ERR] {symbol}: {e} — взяли первый из списка')
@@ -3239,7 +3340,7 @@ def handle_main_signal(signal):
     is_add_position = is_position_active_on_exchange and existing_direction == direction
     is_flip = is_position_active_on_exchange and existing_direction != direction
     if is_flip:
-        send_trade_notification(1901059519, f'[FLIP_DETECTED] Flipping position for {symbol}. Existing direction: {existing_direction}, New direction: {direction}.')
+        send_admin_notification(f'[FLIP_DETECTED] Flipping position for {symbol}. Existing direction: {existing_direction}, New direction: {direction}.')
         with active_trailing_threads_lock:
             existing_thread = active_trailing_threads.get(symbol)
         try:
@@ -3259,12 +3360,12 @@ def handle_main_signal(signal):
                 with db_tx() as conn:
                     cur = conn.cursor()
                     cur.execute('INSERT OR REPLACE INTO symbol_cooldowns (symbol, signals_missed, consecutive_losses) VALUES (?, ?, ?)', (symbol, new_signals_missed, current_consecutive_losses))
-                send_trade_notification(1901059519, f'[SKIP_SIGNAL] Skipping signal for {symbol} due to loss-cooldown. Missed: {new_signals_missed}/2 (DB); consecutive_losses={current_consecutive_losses}')
+                send_admin_notification(f'[SKIP_SIGNAL] Skipping signal for {symbol} due to loss-cooldown. Missed: {new_signals_missed}/2 (DB); consecutive_losses={current_consecutive_losses}')
             except Exception as e:
                 print(f'[COOLDOWN_WRITE_ERR] {e}')
             return
         else:
-            send_trade_notification(1901059519, f'[COOLDOWN_PASSED] Cooldown period passed for {symbol}, proceeding with signal. consecutive_losses={current_consecutive_losses}')
+            send_admin_notification(f'[COOLDOWN_PASSED] Cooldown period passed for {symbol}, proceeding with signal. consecutive_losses={current_consecutive_losses}')
         pos_amt_on_exchange = None
         client_for_close = None
         try:
@@ -3287,7 +3388,7 @@ def handle_main_signal(signal):
                         except Exception:
                             pos_amt_on_exchange = None
             else:
-                send_trade_notification(1901059519, f'[FLIP_ERR] No API keys for user {user_id}, cannot actively close on exchange.')
+                send_admin_notification(f'[FLIP_ERR] No API keys for user {user_id}, cannot actively close on exchange.')
         except Exception as e:
             logging.exception(f'[handle_main_signal] Error while fetching position for flip-close: {e}')
             pos_amt_on_exchange = None
@@ -3298,33 +3399,33 @@ def handle_main_signal(signal):
             except Exception:
                 close_qty = abs(pos_amt_on_exchange)
             if close_qty <= 0:
-                send_trade_notification(1901059519, f'[FLIP_CLOSE_SKIP] Computed close qty <= 0 ({close_qty}) for {symbol}. Aborting flip to avoid partial netting.')
+                send_admin_notification(f'[FLIP_CLOSE_SKIP] Computed close qty <= 0 ({close_qty}) for {symbol}. Aborting flip to avoid partial netting.')
                 return
             qty_str = f'{close_qty:.{qty_precision}f}'
             try:
-                send_trade_notification(1901059519, f'[FLIP_CLOSE_ATTEMPT] Closing on exchange before flip: side={close_side}, qty={qty_str}')
+                send_admin_notification(f'[FLIP_CLOSE_ATTEMPT] Closing on exchange before flip: side={close_side}, qty={qty_str}')
             except Exception:
                 pass
             try:
                 close_order = safe_api_call(client_for_close.new_order, symbol=symbol, side=close_side, type='MARKET', quantity=qty_str, reduceOnly=True)
-                send_trade_notification(1901059519, f'[FLIP_CLOSE_ORDER] {close_order}')
+                send_admin_notification(f'[FLIP_CLOSE_ORDER] {close_order}')
             except Exception as e:
                 err_txt = str(e).lower()
                 if 'notional' in err_txt and 'smaller' in err_txt or '-4164' in err_txt or 'must be no smaller' in err_txt:
                     try:
-                        send_trade_notification(1901059519, f'[FLIP_CLOSE_FALLBACK] Retrying close with reduceOnly=True to bypass min notional for {symbol}')
+                        send_admin_notification(f'[FLIP_CLOSE_FALLBACK] Retrying close with reduceOnly=True to bypass min notional for {symbol}')
                     except Exception:
                         pass
                     try:
                         close_order = safe_api_call(client_for_close.new_order, symbol=symbol, side=close_side, type='MARKET', quantity=qty_str, reduceOnly=True)
-                        send_trade_notification(1901059519, f'[FLIP_CLOSE_ORDER_FALLBACK] {close_order}')
+                        send_admin_notification(f'[FLIP_CLOSE_ORDER_FALLBACK] {close_order}')
                     except Exception as e2:
                         logging.exception(f'[handle_main_signal] Error placing fallback close order during flip: {e2}')
-                        send_trade_notification(1901059519, f'[FLIP_CLOSE_ORDER_ERR] fallback err={e2}')
+                        send_admin_notification(f'[FLIP_CLOSE_ORDER_ERR] fallback err={e2}')
                         return
                 else:
                     logging.exception(f'[handle_main_signal] Error placing close order during flip: {e}')
-                    send_trade_notification(1901059519, f'[FLIP_CLOSE_ORDER_ERR] {e}')
+                    send_admin_notification(f'[FLIP_CLOSE_ORDER_ERR] {e}')
                     return
             closed = False
             try:
@@ -3344,33 +3445,33 @@ def handle_main_signal(signal):
                         closed = True
                         break
                     else:
-                        send_trade_notification(1901059519, f'[FLIP_CLOSE_WAIT] positionAmt still {current_amt:.{qty_precision}f}, attempt {attempt + 1}/{retries}')
+                        send_admin_notification(f'[FLIP_CLOSE_WAIT] positionAmt still {current_amt:.{qty_precision}f}, attempt {attempt + 1}/{retries}')
                 if not closed:
-                    send_trade_notification(1901059519, f"[FLIP_CLOSE_TIMEOUT] Couldn't confirm full close on exchange for {symbol} after {retries} attempts. Current pos: {last_amt}")
+                    send_admin_notification(f"[FLIP_CLOSE_TIMEOUT] Couldn't confirm full close on exchange for {symbol} after {retries} attempts. Current pos: {last_amt}")
                     return
             except Exception as e:
                 logging.exception(f'[handle_main_signal] Exception while polling position after flip-close: {e}')
-                send_trade_notification(1901059519, f'[FLIP_CLOSE_POLL_ERR] {e}')
+                send_admin_notification(f'[FLIP_CLOSE_POLL_ERR] {e}')
                 return
         else:
-            send_trade_notification(1901059519, f'[FLIP_CLOSE_SKIP] No open net position detected on exchange for {symbol} (pos_amt={pos_amt_on_exchange}). Proceeding with local cleanup.')
+            send_admin_notification(f'[FLIP_CLOSE_SKIP] No open net position detected on exchange for {symbol} (pos_amt={pos_amt_on_exchange}). Proceeding with local cleanup.')
         if existing_thread:
             try:
                 existing_thread._handle_position_closed()
-                send_trade_notification(1901059519, f'[FLIP_CLOSE] Closed existing position for {symbol} via thread cleanup.')
+                send_admin_notification(f'[FLIP_CLOSE] Closed existing position for {symbol} via thread cleanup.')
             except Exception as e:
                 logging.exception(f'[handle_main_signal] Error calling existing_thread._handle_position_closed() for {symbol}: {e}')
-                send_trade_notification(1901059519, f'[FLIP_CLOSE_THREAD_ERR] {e}')
+                send_admin_notification(f'[FLIP_CLOSE_THREAD_ERR] {e}')
                 return
         else:
-            send_trade_notification(1901059519, f'[FLIP_CLOSE] No active trailing thread for {symbol}; exchange-close (if any) performed, proceeding to reset local state.')
+            send_admin_notification(f'[FLIP_CLOSE] No active trailing thread for {symbol}; exchange-close (if any) performed, proceeding to reset local state.')
         existing_qty = 0.0
         existing_add_count = 0
         existing_current_entry = None
         is_existing_pos_in_db = False
     if is_add_position and existing_qty > 0:
         if existing_add_count >= 3:
-            send_trade_notification(1901059519, f'[MAX_ADDS] Max adds (3) reached for {symbol}, skipping signal.')
+            send_admin_notification(f'[MAX_ADDS] Max adds (3) reached for {symbol}, skipping signal.')
             with db_tx() as conn:
                 cur = conn.cursor()
                 new_missed_count = min(2, current_signals_missed + 1)
@@ -3381,7 +3482,7 @@ def handle_main_signal(signal):
             cur.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
             keys = cur.fetchone()
         if not (keys and keys[0] and keys[1]):
-            send_trade_notification(1901059519, f'[ADD_ERROR] No API keys for user {user_id}')
+            send_admin_notification(f'[ADD_ERROR] No API keys for user {user_id}')
             return
         api_key, secret_key = (keys[0], keys[1])
         client = get_trading_client(api_key, secret_key)
@@ -3423,13 +3524,13 @@ def handle_main_signal(signal):
                     target_qty_to_add = round(float(initial_qty), int(qty_precision))
                 except Exception:
                     target_qty_to_add = float(initial_qty)
-                send_trade_notification(1901059519, f'[ADD_QTY_BASELINE] Using initial qty baseline for add: {target_qty_to_add:.{qty_precision}f}')
+                send_admin_notification(f'[ADD_QTY_BASELINE] Using initial qty baseline for add: {target_qty_to_add:.{qty_precision}f}')
             elif signal_qty and signal_qty > 0:
                 try:
                     target_qty_to_add = round(float(signal_qty), int(qty_precision))
                 except Exception:
                     target_qty_to_add = float(signal_qty)
-                send_trade_notification(1901059519, f'[ADD_QTY_SIGNAL_FALLBACK] initial qty unavailable, using signal quantity: {target_qty_to_add:.{qty_precision}f}')
+                send_admin_notification(f'[ADD_QTY_SIGNAL_FALLBACK] initial qty unavailable, using signal quantity: {target_qty_to_add:.{qty_precision}f}')
         except Exception:
             target_qty_to_add = None
         if target_qty_to_add is None:
@@ -3475,7 +3576,7 @@ def handle_main_signal(signal):
                     target_qty_to_add = round(float(thread_qty), int(qty_precision))
                 except Exception:
                     target_qty_to_add = float(thread_qty)
-                send_trade_notification(1901059519, f'[ADD_QTY_FROM_THREAD] Using qty from thread/message for add: {target_qty_to_add:.{qty_precision}f}')
+                send_admin_notification(f'[ADD_QTY_FROM_THREAD] Using qty from thread/message for add: {target_qty_to_add:.{qty_precision}f}')
         if target_qty_to_add is None:
             try:
                 target_qty_to_add = max(existing_qty * 0.5, 0.0)
@@ -3530,7 +3631,7 @@ def handle_main_signal(signal):
                     target_qty_to_add = round(float(thread_qty), int(qty_precision))
                 except Exception:
                     target_qty_to_add = float(thread_qty)
-                send_trade_notification(1901059519, f'[ADD_QTY_FROM_THREAD] Using qty from thread/message for add: {target_qty_to_add:.{qty_precision}f}')
+                send_admin_notification(f'[ADD_QTY_FROM_THREAD] Using qty from thread/message for add: {target_qty_to_add:.{qty_precision}f}')
         if target_qty_to_add is None:
             try:
                 target_qty_to_add = max(existing_qty * 0.5, 0.0)
@@ -3538,13 +3639,13 @@ def handle_main_signal(signal):
             except Exception:
                 target_qty_to_add = 0.0
         if target_qty_to_add <= 0:
-            send_trade_notification(1901059519, f'[ADD_QTY_ZERO] computed add qty <= 0 for {symbol}, skipping add.')
+            send_admin_notification(f'[ADD_QTY_ZERO] computed add qty <= 0 for {symbol}, skipping add.')
             return
         try:
             side = 'BUY' if direction == 'LONG' else 'SELL'
-            send_trade_notification(1901059519, f'[ENTRY_ADD_ATTEMPT] {side} {target_qty_to_add}')
+            send_admin_notification(f'[ENTRY_ADD_ATTEMPT] {side} {target_qty_to_add}')
             entry_order = safe_api_call(client.new_order, symbol=symbol, side=side, type='MARKET', quantity=f'{target_qty_to_add:.{qty_precision}f}')
-            send_trade_notification(1901059519, f'[ENTRY_ADD_RESULT] {entry_order}')
+            send_admin_notification(f'[ENTRY_ADD_RESULT] {entry_order}')
             fill_qty = 0.0
             fill_price = float(entry_price)
             try:
@@ -3631,17 +3732,17 @@ def handle_main_signal(signal):
                         except Exception:
                             pass
                     if fill_qty <= 0:
-                        send_trade_notification(1901059519, f'[ENTRY_ERR_ADD] Could not verify order fill for {symbol}. Aborting add.')
+                        send_admin_notification(f'[ENTRY_ERR_ADD] Could not verify order fill for {symbol}. Aborting add.')
                         return
                 except Exception as e:
                     logging.exception(f'[ENTRY_WAIT_ERR] {e}')
             if not (fill_price and float(fill_price) > 0):
                 fill_price = float(entry_price)
-                send_trade_notification(1901059519, f'[WARN_FILL_PRICE_FALLBACK] Used signal entry_price as fill_price for {symbol}: {fill_price}')
-            send_trade_notification(1901059519, f'[ENTRY_ADD_FILL] Price: {fill_price:.{price_precision}f}, Quantity: {fill_qty:.{qty_precision}f}')
+                send_admin_notification(f'[WARN_FILL_PRICE_FALLBACK] Used signal entry_price as fill_price for {symbol}: {fill_price}')
+            send_admin_notification(f'[ENTRY_ADD_FILL] Price: {fill_price:.{price_precision}f}, Quantity: {fill_qty:.{qty_precision}f}')
         except Exception as e:
             logging.exception(f'[handle_main_signal] Entry add order placement error: {e}')
-            send_trade_notification(1901059519, f'[ENTRY_ADD_ERR] {e}')
+            send_admin_notification(f'[ENTRY_ADD_ERR] {e}')
             return
         try:
             new_add_count = int(existing_add_count) + 1
@@ -3657,7 +3758,7 @@ def handle_main_signal(signal):
                 new_avg_price = float(round(new_avg_price, int(price_precision)))
             except Exception:
                 pass
-            send_trade_notification(1901059519, f'[ADD_APPLIED] symbol={symbol} fill_qty={fill_qty} fill_price={fill_price} added_qty={added_qty} total_new_qty={total_new_qty} new_add_count={new_add_count} new_avg_price={new_avg_price}')
+            send_admin_notification(f'[ADD_APPLIED] symbol={symbol} fill_qty={fill_qty} fill_price={fill_price} added_qty={added_qty} total_new_qty={total_new_qty} new_add_count={new_add_count} new_avg_price={new_avg_price}')
         except Exception as e:
             logging.exception(f'[ADD_APPLY_ERR] error applying add for {symbol}: {e}')
             return
@@ -3693,9 +3794,9 @@ def handle_main_signal(signal):
                 if candidate_stops:
                     ref_price = float(existing_current_entry)
                     chosen_stop = max(candidate_stops, key=lambda s: abs(float(s) - ref_price))
-                    send_trade_notification(1901059519, f'[STOP_CHOSEN_ADD] {symbol}: выбран самый удалённый стоп {chosen_stop} (ref={ref_price})')
+                    send_admin_notification(f'[STOP_CHOSEN_ADD] {symbol}: выбран самый удалённый стоп {chosen_stop} (ref={ref_price})')
         except Exception as e:
-            send_trade_notification(1901059519, f'[STOP_CHOOSE_ADD_ERR] {symbol}: {e}')
+            send_admin_notification(f'[STOP_CHOOSE_ADD_ERR] {symbol}: {e}')
         stop_oid = None
         if chosen_stop and chosen_stop != 0:
             stop_side = 'BUY' if direction == 'SHORT' else 'SELL'
@@ -3716,17 +3817,17 @@ def handle_main_signal(signal):
                         workingType='CONTRACT_PRICE'
                     )
                     if stop_oid:
-                        send_trade_notification(1901059519, f'[STOP_CREATE_ADD] success attempt={attempt + 1} kind={stop_kind} Price: {chosen_stop:.{price_precision}f}, Qty: {stop_qty_str}, ID: {stop_oid}')
+                        send_admin_notification(f'[STOP_CREATE_ADD] success attempt={attempt + 1} kind={stop_kind} Price: {chosen_stop:.{price_precision}f}, Qty: {stop_qty_str}, ID: {stop_oid}')
                         break
-                    send_trade_notification(1901059519, f'[STOP_CREATE_ADD] attempt={attempt + 1} returned no orderId, retrying... raw={stop_raw}')
+                    send_admin_notification(f'[STOP_CREATE_ADD] attempt={attempt + 1} returned no orderId, retrying... raw={stop_raw}')
                 except Exception as e:
                     logging.exception(f'[handle_main_signal] Stop order placement error during add: attempt {attempt + 1}: {e}')
-                    send_trade_notification(1901059519, f'[STOP_CREATE_ERR_ADD] attempt={attempt + 1} err={e}; SL={chosen_stop:.{price_precision}f}')
+                    send_admin_notification(f'[STOP_CREATE_ERR_ADD] attempt={attempt + 1} err={e}; SL={chosen_stop:.{price_precision}f}')
                 time.sleep(1)
             if not stop_oid:
-                send_trade_notification(1901059519, f'[STOP_CREATE_ADD_FAIL] Не удалось создать стоп для {symbol} после 3 попыток. Проверьте API/логи.')
+                send_admin_notification(f'[STOP_CREATE_ADD_FAIL] Не удалось создать стоп для {symbol} после 3 попыток. Проверьте API/логи.')
         else:
-            send_trade_notification(1901059519, '[STOP_PLAN_ADD] Chosen stop price was None or 0, skipping stop order.')
+            send_admin_notification('[STOP_PLAN_ADD] Chosen stop price was None or 0, skipping stop order.')
         signal_prices = sorted(tp_levels.values(), reverse=direction == 'LONG')
         if symbol == 'BTCUSDT':
             if len(signal_prices) >= 5:
@@ -3787,9 +3888,9 @@ def handle_main_signal(signal):
                         tp_ids.append(str(tp_oid))
                         tp_order_results.append(res)
                         tp_data_for_db[f'tp{i + 1}'] = {'price': price, 'volume': vol, 'order_id': tp_oid}
-                        send_trade_notification(1901059519, f'[TP_CREATE_BATCH] idx={i} price={price:.{price_precision}f} qty={vol_str} id={tp_oid}')
+                        send_admin_notification(f'[TP_CREATE_BATCH] idx={i} price={price:.{price_precision}f} qty={vol_str} id={tp_oid}')
                     else:
-                        send_trade_notification(1901059519, f"[TP_CREATE_BATCH_ERR] idx={i} price={price:.{price_precision}f} qty={vol_str} err={res}")
+                        send_admin_notification(f"[TP_CREATE_BATCH_ERR] idx={i} price={price:.{price_precision}f} qty={vol_str} err={res}")
                         try:
                             tp_order = safe_api_call(client.new_order, symbol=symbol, side=tp_side, type='LIMIT',
                                                     quantity=vol_str, price=price, timeInForce='GTC', reduceOnly=True)
@@ -3798,14 +3899,14 @@ def handle_main_signal(signal):
                                 tp_ids.append(str(tp_oid2))
                                 tp_order_results.append(tp_order)
                                 tp_data_for_db[f'tp{i + 1}'] = {'price': price, 'volume': vol, 'order_id': tp_oid2}
-                                send_trade_notification(1901059519, f"[TP_CREATE_FALLBACK] idx={i} price={price:.{price_precision}f} qty={vol_str} id={tp_oid2}")
+                                send_admin_notification(f"[TP_CREATE_FALLBACK] idx={i} price={price:.{price_precision}f} qty={vol_str} id={tp_oid2}")
                         except Exception as e2:
-                            send_trade_notification(1901059519, f"[TP_CREATE_FALLBACK_ERR] idx={i} err={e2}")
+                            send_admin_notification(f"[TP_CREATE_FALLBACK_ERR] idx={i} err={e2}")
                 batch_ok = True
             except Exception as e:
                 logging.exception(f'[handle_main_signal] batchOrders placement error: {e}')
                 try:
-                    send_trade_notification(1901059519, f'[TP_BATCH_ERR] {e}')
+                    send_admin_notification(f'[TP_BATCH_ERR] {e}')
                 except Exception:
                     pass
                 batch_ok = False
@@ -3824,15 +3925,15 @@ def handle_main_signal(signal):
                     tp_ids.append(str(tp_oid))
                     tp_order_results.append(tp_order)
                     tp_data_for_db[f'tp{i + 1}'] = {'price': price, 'volume': vol, 'order_id': tp_oid}
-                    send_trade_notification(1901059519, f'[TP_CREATE] idx={i} price={price:.{price_precision}f} qty={vol_str} id={tp_oid}')
+                    send_admin_notification(f'[TP_CREATE] idx={i} price={price:.{price_precision}f} qty={vol_str} id={tp_oid}')
                 except Exception as e:
                     logging.exception(f'[handle_main_signal] TP {i} order placement error: {e}')
-                    send_trade_notification(1901059519, f'[TP_CREATE_ERR] idx={i} price={price:.{price_precision}f} qty={vol_str} err={e}')
+                    send_admin_notification(f'[TP_CREATE_ERR] idx={i} price={price:.{price_precision}f} qty={vol_str} err={e}')
         if tp_ids:
             tp_msg = ', '.join([f'{p:.{price_precision}f}' for p in signal_prices])
-            send_trade_notification(1901059519, f'[TP_PLACED] {len(tp_ids)} orders placed. Prices: {tp_msg}')
+            send_admin_notification(f'[TP_PLACED] {len(tp_ids)} orders placed. Prices: {tp_msg}')
         else:
-            send_trade_notification(1901059519, '[TP_PLACED] No TP orders were placed (all volumes were zero or placement failed).')
+            send_admin_notification('[TP_PLACED] No TP orders were placed (all volumes were zero or placement failed).')
         first_tp_order_id = _pick_first_tp_order_id(entry_price, direction, tp_data_for_db, tp_ids)
         try:
             replace_tp_data = []
@@ -3842,10 +3943,10 @@ def handle_main_signal(signal):
             with DB_LOCK:
                 cursor.execute('UPDATE positions SET add_count = COALESCE(add_count,0) + 1, entry_order_id = ? WHERE symbol = ?', (str(entry_order.get('orderId') if isinstance(entry_order, dict) else entry_order), symbol))
                 conn.commit()
-            send_trade_notification(1901059519, f'[DB_UPDATE_ADD] Position for {symbol} updated with new orders after add.')
+            send_admin_notification(f'[DB_UPDATE_ADD] Position for {symbol} updated with new orders after add.')
         except Exception as e:
             logging.exception(f'[handle_main_signal] DB update error after add: {e}')
-            send_trade_notification(1901059519, f'[DB_UPDATE_ERR_ADD] {e}')
+            send_admin_notification(f'[DB_UPDATE_ERR_ADD] {e}')
             return
         try:
             signal_prices_add = sorted(tp_levels.values(), reverse=direction == 'LONG')
@@ -3854,7 +3955,7 @@ def handle_main_signal(signal):
         try:
             tp_msg_add = ', '.join([f'{p:.{price_precision}f}' for p in signal_prices_add]) if signal_prices_add else ''
             add_msg = f"[THREAD_START_ADD] 📈 Позиция {symbol} добавлена! (Add #{new_add_count})\n| Entry: {entry_price:.{price_precision}f}\n| Avg Entry: {new_avg_price:.{price_precision}f}\n| Stop: {chosen_stop:.{price_precision}f}\n| TP: {tp_msg_add}\n| Qty Added (requested): {target_qty_to_add:.{qty_precision}f}\n| Qty Added (applied): {added_qty:.{qty_precision}f}\n| Total Qty: {total_new_qty:.{qty_precision}f}\n| AddCount: {new_add_count}\n| entry_id={(entry_order.get('orderId') if isinstance(entry_order, dict) else entry_order)} stop_id={stop_oid} recovery_id={existing_recovery_id}"
-            send_trade_notifications([1901059519, user_id], add_msg)
+            send_trade_notifications(get_notification_admin_ids(extra_ids=[user_id]), add_msg)
         except Exception as _e:
             logging.exception(f'[ADD_NOTIFY_ERR] {_e}')
         with active_trailing_threads_lock:
@@ -3878,7 +3979,7 @@ def handle_main_signal(signal):
                     th.update_stop_loss_with_new_quantity()
                 except Exception:
                     pass
-                send_trade_notification(1901059519, f'[ADD_HANDLED_IN_THREAD] Updated existing thread for {symbol} with new avg={new_avg_price} qty={total_new_qty}')
+                send_admin_notification(f'[ADD_HANDLED_IN_THREAD] Updated existing thread for {symbol} with new avg={new_avg_price} qty={total_new_qty}')
             except Exception as e:
                 logging.exception(f'[handle_main_signal] Failed to update existing thread for {symbol}: {e}')
                 try:
@@ -3891,7 +3992,7 @@ def handle_main_signal(signal):
                         ensure_user_stream(user_id, api_key, secret_key)
                     except Exception:
                         pass
-                    send_trade_notification(1901059519, f'[ADD_FALLBACK_THREAD_CREATED] for {symbol}')
+                    send_admin_notification(f'[ADD_FALLBACK_THREAD_CREATED] for {symbol}')
                 except Exception as ee:
                     logging.exception(f'[handle_main_signal] Fallback thread create failed for {symbol}: {ee}')
         else:
@@ -3905,7 +4006,7 @@ def handle_main_signal(signal):
                         ensure_user_stream(user_id, api_key, secret_key)
                     except Exception:
                         pass
-                send_trade_notification(1901059519, f'[ADD_THREAD_CREATED] for {symbol}')
+                send_admin_notification(f'[ADD_THREAD_CREATED] for {symbol}')
             except Exception as e:
                 logging.exception(f'[handle_main_signal] Creating trailing thread after add failed for {symbol}: {e}')
         return
@@ -3915,7 +4016,7 @@ def handle_main_signal(signal):
             cur.execute('SELECT api_key, secret_key FROM users WHERE user_id = ?', (user_id,))
             keys = cur.fetchone()
         if not keys or not keys[0] or (not keys[1]):
-            send_trade_notification(1901059519, f'[AUTH_ERROR] No API key/secret found for user {user_id}')
+            send_admin_notification(f'[AUTH_ERROR] No API key/secret found for user {user_id}')
             return
         api_key, secret_key = (keys[0], keys[1])
         client = get_trading_client(api_key, secret_key)
@@ -3928,18 +4029,18 @@ def handle_main_signal(signal):
             cur.execute('SELECT is_active FROM users WHERE user_id = ?', (user_id,))
             user_row = cur.fetchone()
         if user_row and (not user_row[0]):
-            send_trade_notification(1901059519, f'[USER_DISABLED] {user_id}')
+            send_admin_notification(f'[USER_DISABLED] {user_id}')
             return
         with db_tx() as conn:
             cur = conn.cursor()
             cur.execute('SELECT is_active FROM trading_pairs WHERE symbol = ?', (symbol,))
             r = cur.fetchone()
         if not r or not r[0]:
-            send_trade_notification(1901059519, f'[PAIR_DISABLED] {symbol}')
+            send_admin_notification(f'[PAIR_DISABLED] {symbol}')
             return
         symbol_info = get_symbol_info_cached(client, symbol)
         if not symbol_info:
-            send_trade_notification(1901059519, f'[SYMBOL_ERROR] Symbol {symbol} not found on exchange')
+            send_admin_notification(f'[SYMBOL_ERROR] Symbol {symbol} not found on exchange')
             return
         price_precision = 2
         qty_precision = 3
@@ -3961,9 +4062,9 @@ def handle_main_signal(signal):
         return
     update_user_balance(user_id)
     available_balance = get_available_balance(user_id)
-    send_trade_notification(1901059519, f'[BALANCE] {available_balance}')
+    send_admin_notification(f'[BALANCE] {available_balance}')
     if available_balance is None or available_balance <= 0:
-        send_trade_notification(1901059519, '[BALANCE_ERROR] insufficient')
+        send_admin_notification('[BALANCE_ERROR] insufficient')
         return
     total_balance = available_balance  # reuse, avoid extra API call
     target_balance = total_balance * VOLUME_PERCENT
@@ -3985,9 +4086,9 @@ def handle_main_signal(signal):
         except Exception:
             pass
     if target_qty_calc <= 0:
-        send_trade_notification(1901059519, f'[SIZE_ERROR] Calculated qty <= 0 for {symbol}')
+        send_admin_notification(f'[SIZE_ERROR] Calculated qty <= 0 for {symbol}')
         return
-    send_trade_notification(1901059519, f'[SIZE_CALC] balance_part={target_balance:.4f}, lev={leverage}, entry={entry_price:.4f}, raw_qty={target_qty_calc:.8f}')
+    send_admin_notification(f'[SIZE_CALC] balance_part={target_balance:.4f}, lev={leverage}, entry={entry_price:.4f}, raw_qty={target_qty_calc:.8f}')
     total_new_qty = target_qty_calc
     # Loss recovery logic (aligned with provided fragment; max cap adjusted to 3x)
     loss_recovery_active = False
@@ -4003,9 +4104,9 @@ def handle_main_signal(signal):
                 if num_active_pairs > 0:
                     current_loss = total_loss / num_active_pairs
                     loss_recovery_active = True
-                    send_trade_notification(1901059519, f'[RECOVERY] Loss recovery активен для {symbol}, общий убыток: {total_loss:.4f} USDT, активных пар: {num_active_pairs}, убыток на пару: {current_loss:.4f} USDT')
+                    send_admin_notification(f'[RECOVERY] Loss recovery активен для {symbol}, общий убыток: {total_loss:.4f} USDT, активных пар: {num_active_pairs}, убыток на пару: {current_loss:.4f} USDT')
                 else:
-                    send_trade_notification(1901059519, '[RECOVERY] Loss recovery активен, но нет активных пар. current_loss = 0.')
+                    send_admin_notification('[RECOVERY] Loss recovery активен, но нет активных пар. current_loss = 0.')
                     current_loss = 0.0
             else:
                 current_loss = 0.0
@@ -4041,21 +4142,21 @@ def handle_main_signal(signal):
                 max_allowed_quantity = standard_quantity * 3
                 required_quantity = min(required_quantity, max_allowed_quantity)
                 quantity = required_quantity if required_quantity > standard_quantity else standard_quantity
-                send_trade_notification(1901059519, f'[DEBUG RECOVERY] chosen_qty={quantity:.8f} (std={standard_quantity:.8f}, req={required_quantity:.8f}, cap3x={max_allowed_quantity:.8f})')
+                send_admin_notification(f'[DEBUG RECOVERY] chosen_qty={quantity:.8f} (std={standard_quantity:.8f}, req={required_quantity:.8f}, cap3x={max_allowed_quantity:.8f})')
             except Exception as e:
-                send_trade_notification(1901059519, f'[DEBUG RECOVERY] Ошибка расчёта: {e}, беру стандартный объём')
+                send_admin_notification(f'[DEBUG RECOVERY] Ошибка расчёта: {e}, беру стандартный объём')
                 quantity = standard_quantity
     else:
         quantity = standard_quantity
     total_new_qty = quantity
     try:
         res = safe_api_call(client.change_leverage, symbol=symbol, leverage=leverage)
-        send_trade_notification(1901059519, f'[LEVERAGE] set {leverage} for {symbol}')
+        send_admin_notification(f'[LEVERAGE] set {leverage} for {symbol}')
     except Exception as e:
-        send_trade_notification(1901059519, f'[LEVERAGE_ERR] {e}')
+        send_admin_notification(f'[LEVERAGE_ERR] {e}')
     try:
         ok_cancel = ensure_cancel_all_orders(client, symbol, api_key, secret_key)
-        send_trade_notification(1901059519, f'[ENSURE_CANCEL] {symbol} ok={ok_cancel}')
+        send_admin_notification(f'[ENSURE_CANCEL] {symbol} ok={ok_cancel}')
     except Exception as e:
         logging.exception(f'[handle_main_signal] Cancel orders error: {e}')
     try:
@@ -4147,22 +4248,22 @@ def handle_main_signal(signal):
                     except Exception:
                         pass
                 if fill_qty <= 0:
-                    send_trade_notification(1901059519, f'[ENTRY_ERR] Could not verify order fill for {symbol} after polling. Aborting.')
+                    send_admin_notification(f'[ENTRY_ERR] Could not verify order fill for {symbol} after polling. Aborting.')
                     return
             except Exception as e:
                 logging.exception(f'[ENTRY_WAIT_ERR] {e}')
                 return
         if not (fill_price and float(fill_price) > 0):
             fill_price = float(entry_price)
-            send_trade_notification(1901059519, f'[WARN_FILL_PRICE_FALLBACK] Used signal entry_price as fill_price for {symbol}: {fill_price}')
-        send_trade_notification(1901059519, f'[ENTRY_FINAL_FILL] Price: {fill_price:.{price_precision}f}, Quantity: {fill_qty:.{qty_precision}f}')
+            send_admin_notification(f'[WARN_FILL_PRICE_FALLBACK] Used signal entry_price as fill_price for {symbol}: {fill_price}')
+        send_admin_notification(f'[ENTRY_FINAL_FILL] Price: {fill_price:.{price_precision}f}, Quantity: {fill_qty:.{qty_precision}f}')
     except Exception as e:
         logging.exception(f'[handle_main_signal] Entry order placement or verification error: {e}')
-        send_trade_notification(1901059519, f'[ENTRY_ERR] {e}')
+        send_admin_notification(f'[ENTRY_ERR] {e}')
         return
     if fill_qty <= 0 or fill_price <= 0:
         logging.error(f'[handle_main_signal] Invalid fill_qty ({fill_qty}) or fill_price ({fill_price}) for {symbol}.')
-        send_trade_notification(1901059519, f'[ENTRY_ERR] Invalid fill confirmation for {symbol}: qty={fill_qty}, price={fill_price}')
+        send_admin_notification(f'[ENTRY_ERR] Invalid fill confirmation for {symbol}: qty={fill_qty}, price={fill_price}')
         return
     new_avg_price = fill_price
     total_new_qty = fill_qty
@@ -4193,12 +4294,12 @@ def handle_main_signal(signal):
                 closePosition=False,
                 workingType='CONTRACT_PRICE',
             )
-            send_trade_notification(1901059519, f'[STOP_CREATE] Price: {chosen_stop:.{price_precision}f}, Qty: {stop_qty_str}, ID: {stop_oid}')
+            send_admin_notification(f'[STOP_CREATE] Price: {chosen_stop:.{price_precision}f}, Qty: {stop_qty_str}, ID: {stop_oid}')
         except Exception as e:
             logging.exception(f'[handle_main_signal] Stop order placement error: {e}')
-            send_trade_notification(1901059519, f'[STOP_CREATE_ERR] {e}; SL={chosen_stop:.{price_precision}f}')
+            send_admin_notification(f'[STOP_CREATE_ERR] {e}; SL={chosen_stop:.{price_precision}f}')
     else:
-        send_trade_notification(1901059519, '[STOP_PLAN] Chosen stop price was None or 0, skipping stop order.')
+        send_admin_notification('[STOP_PLAN] Chosen stop price was None or 0, skipping stop order.')
     signal_prices = sorted(tp_levels.values(), reverse=direction == 'LONG')
     if symbol == 'BTCUSDT':
         if len(signal_prices) >= 5:
@@ -4240,15 +4341,15 @@ def handle_main_signal(signal):
             tp_ids.append(str(tp_oid))
             tp_order_results.append(tp_order)
             tp_data_for_db[f'tp{i + 1}'] = {'price': price, 'volume': vol, 'order_id': tp_oid}
-            send_trade_notification(1901059519, f'[TP_CREATE] idx={i} price={price:.{price_precision}f} qty={vol_str} id={tp_oid}')
+            send_admin_notification(f'[TP_CREATE] idx={i} price={price:.{price_precision}f} qty={vol_str} id={tp_oid}')
         except Exception as e:
             logging.exception(f'[handle_main_signal] TP {i} order placement error: {e}')
-            send_trade_notification(1901059519, f'[TP_CREATE_ERR] idx={i} price={price:.{price_precision}f} qty={vol_str} err={e}')
+            send_admin_notification(f'[TP_CREATE_ERR] idx={i} price={price:.{price_precision}f} qty={vol_str} err={e}')
     if tp_ids:
         tp_msg = ', '.join([f'{p:.{price_precision}f}' for p in signal_prices])
-        send_trade_notification(1901059519, f'[TP_PLACED] {len(tp_ids)} orders placed. Prices: {tp_msg}')
+        send_admin_notification(f'[TP_PLACED] {len(tp_ids)} orders placed. Prices: {tp_msg}')
     else:
-        send_trade_notification(1901059519, '[TP_PLACED] No TP orders were placed (all volumes were zero or placement failed).')
+        send_admin_notification('[TP_PLACED] No TP orders were placed (all volumes were zero or placement failed).')
     first_tp_order_id = _pick_first_tp_order_id(entry_price, direction, tp_data_for_db, tp_ids)
     try:
         tp_ids_json = json.dumps(tp_ids) if tp_ids else '[]'
@@ -4256,7 +4357,7 @@ def handle_main_signal(signal):
         with db_tx() as conn:
             cur = conn.cursor()
             cur.execute('\n                INSERT OR REPLACE INTO positions\n                (symbol, user_id, direction, quantity, entry_price, current_entry_price, stop_price, tp_data, entry_order_id, stop_order_id, recovery_order_id, metadata, add_count, signals_missed_after_stop)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ', (symbol, user_id, direction, total_new_qty, new_avg_price, fill_price, chosen_stop, json.dumps(tp_data_for_db), entry_order.get('orderId') if isinstance(entry_order, dict) else entry_order, stop_oid, None, metadata_json, 0, 0))
-        send_trade_notification(1901059519, f'[DB_UPDATE] Position for {symbol} updated successfully.')
+        send_admin_notification(f'[DB_UPDATE] Position for {symbol} updated successfully.')
         try:
             with db_tx() as conn:
                 cur = conn.cursor()
@@ -4266,7 +4367,7 @@ def handle_main_signal(signal):
             pass
     except Exception as e:
         logging.exception(f'[handle_main_signal] DB update error: {e}')
-        send_trade_notification(1901059519, f'[DB_UPDATE_ERR] {e}')
+        send_admin_notification(f'[DB_UPDATE_ERR] {e}')
         return
     try:
         if tp_order_results:
@@ -4277,13 +4378,13 @@ def handle_main_signal(signal):
         trailing_thread.start()
         with active_trailing_threads_lock:
             active_trailing_threads[symbol] = trailing_thread
-        send_trade_notification(1901059519, f'[THREAD_ENSURED] Trailing thread for {symbol} ensured.')
+        send_admin_notification(f'[THREAD_ENSURED] Trailing thread for {symbol} ensured.')
     except Exception as e:
         logging.exception(f'[handle_main_signal] Error ensuring trailing thread for {symbol}: {e}')
-        send_trade_notification(1901059519, f'[THREAD_ENSURE_ERR] {e}')
+        send_admin_notification(f'[THREAD_ENSURE_ERR] {e}')
     tp_msg = ', '.join([f'{p:.{price_precision}f}' for p in signal_prices])
     msg = f"✅ Сделка открыта: {symbol} {direction}\n| Entry: {fill_price:.{price_precision}f}\n| Stop: {chosen_stop:.{price_precision}f}\n| TP: {tp_msg}\n| TP_ids: {tp_ids}\n| Qty: {total_new_qty:.{qty_precision}f}\n| AddCount: {0}\n| entry_id={(entry_order.get('orderId') if isinstance(entry_order, dict) else entry_order)} stop_id={stop_oid} recovery_id=None"
-    send_trade_notification(1901059519, f'[THREAD_START] {msg}')
+    send_admin_notification(f'[THREAD_START] {msg}')
     try:
         send_trade_notification(user_id, msg)
     except Exception as e:
@@ -4336,15 +4437,22 @@ def show_settings(message):
         total_balance = cursor.fetchone()[0] or 0
         cursor.execute('SELECT user_id, balance FROM users WHERE is_active = 1')
         active_users = cursor.fetchall()
+        selected_admins = get_selected_admin_ids()
+        selected_labels = []
+        for idx, admin_id in enumerate(ADMINS, start=1):
+            if admin_id in selected_admins:
+                selected_labels.append(f'{idx} ({admin_id})')
         message_text = '📊 Текущие настройки и балансы:\n'
         message_text += f'💰 Общий баланс активных пользователей (с позициями): {total_balance:.2f} USDT\n'
+        message_text += f'🌐 Binance режим: {get_binance_mode_label()}\n'
+        message_text += f'👮 Активные админы для сигналов: {", ".join(selected_labels) if selected_labels else "не выбраны"}\n'
         message_text += '👥 Активные пользователи:\n'
-        for user in active_users:
-            user_id, balance = user
-            message_text += f'- Пользователь {user_id}: {balance:.2f} USDT\n'
+        for active_user_id, balance in active_users:
+            message_text += f'- Пользователь {active_user_id}: {balance:.2f} USDT\n'
         message_text += '\n⚙️ Настройки объемов:\n'
         message_text += f'- BTC: {BTC_VOLUME_PERCENT * 100:.1f}% от баланса\n'
         message_text += f'- Другие пары: {VOLUME_PERCENT * 100:.1f}% от баланса\n'
+        message_text += '\nКоманды:\n/testnet on|off\n/set_adm 1\n/set_adm 2\n/set_adm 1,2'
         bot.send_message(user_id, message_text)
     except Exception as e:
         bot.send_message(user_id, f'❌ Ошибка при получении данных: {str(e)}')
@@ -4385,8 +4493,44 @@ def set_volume_percent(message):
             bot.send_message(user_id, f'✅ Процент установлен: {percent * 100}%')
         else:
             bot.send_message(user_id, '❗ Укажите процент от 0.1 до 5 (например: /set_volume_percent 2)')
-    except Exception as e:
+    except Exception:
         bot.send_message(user_id, '❗ Неверный формат команды. Используйте /set_volume_percent 2')
+
+@bot.message_handler(commands=['testnet'])
+def set_testnet_mode(message):
+    user_id = message.from_user.id
+    if user_id not in ADMINS:
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    if len(parts) == 1:
+        bot.send_message(user_id, f'Текущий режим Binance: {get_binance_mode_label()}\nИспользование: /testnet on или /testnet off')
+        return
+    value = parts[1].strip().lower()
+    if value not in ('on', 'off'):
+        bot.send_message(user_id, '❗ Используйте /testnet on или /testnet off')
+        return
+    apply_binance_runtime_mode(value == 'on', persist=True)
+    bot.send_message(user_id, f'✅ Режим Binance переключен: {get_binance_mode_label()}')
+
+@bot.message_handler(commands=['set_adm'])
+def set_active_admins(message):
+    user_id = message.from_user.id
+    if user_id not in ADMINS:
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    if len(parts) == 1:
+        bot.send_message(user_id, '❗ Используйте /set_adm 1, /set_adm 2 или /set_adm 1,2')
+        return
+    raw_selection = parts[1].replace(' ', '')
+    tokens = [token for token in raw_selection.split(',') if token]
+    if not tokens or any(token not in ('1', '2') for token in tokens):
+        bot.send_message(user_id, '❗ Допустимые значения: 1, 2 или 1,2')
+        return
+    selected = _parse_admin_selection(raw_selection)
+    selected_positions = [str(ADMINS.index(admin_id) + 1) for admin_id in selected if admin_id in ADMINS]
+    _setting_set('active_admins', ','.join(selected_positions))
+    labels = [f'{ADMINS.index(admin_id) + 1} ({admin_id})' for admin_id in selected if admin_id in ADMINS]
+    bot.send_message(user_id, f'✅ Активные админы переключены: {", ".join(labels)}')
 @bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_pair_'))
 def toggle_pair_status(call):
     user_id = call.from_user.id
@@ -4482,13 +4626,14 @@ def handle_input(message):
             bot.send_message(user_id, f'✅ Ключи сохранены. Начальный депозит: {initial_balance:.2f} USDT')
         except Exception as e:
             hint = _auth_error_hint(e)
-            env_label = 'TESTNET' if BINANCE_TESTNET else 'MAINNET'
+            env_label = get_binance_mode_label()
             bot.send_message(user_id, f'❌ Ошибка авторизации ({env_label}): {str(e)}\n\n💡 {hint}')
             cursor.execute('UPDATE users SET api_key = NULL, secret_key = NULL WHERE user_id = ?', (user_id,))
             conn.commit()
     else:
         bot.send_message(user_id, '❌ Ключи уже введены. Используйте /start для перезаписи.')
 if __name__ == '__main__':
+    apply_binance_runtime_mode(is_testnet_enabled(), persist=False)
     recalculate_losses()
     start_signal_workers()
     try:
@@ -4504,6 +4649,6 @@ if __name__ == '__main__':
     telegram_thread.start()
     balance_monitor = BalanceMonitor()
     balance_monitor.start()
-    health_heartbeat = HealthHeartbeatThread(target_user_id=1901059519)
+    health_heartbeat = HealthHeartbeatThread(target_user_id=get_primary_admin_id())
     health_heartbeat.start()
     app.run(port=5001, debug=False)
