@@ -1944,7 +1944,8 @@ class TrailingStopThread(threading.Thread):
                     stream_ok = bool(mgr and mgr.is_alive() and getattr(mgr, 'is_connected', False) and (now_ts - float(getattr(mgr, 'last_msg_ts', 0.0) or 0.0) < 120.0))
                 except Exception:
                     stream_ok = False
-                do_poll = (not stream_ok) and ((now_ts - self._last_emergency_poll_ts) > 60.0)
+                poll_interval = 60.0 if not stream_ok else 120.0
+                do_poll = (now_ts - self._last_emergency_poll_ts) > poll_interval
                 if ws_pos_zero or ws_stop_fired:
                     self._handle_position_closed()
                     break
